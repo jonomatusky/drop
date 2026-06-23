@@ -11,7 +11,7 @@ publish path/to/report.html   →   https://drop.example.com/report/
 
 This is **personal, self-hostable, open-source infrastructure** — a tool you
 deploy to *your own* Cloudflare account. It is **not** a hosted product and there
-is nothing to sign up for. My own deployment runs at
+is nothing to sign up for. The author's deployment runs at
 **[drop.jonomatus.ky](https://drop.jonomatus.ky)**, and there's a live writeup of
 the design (published with the tool itself) at
 **<https://drop.jonomatus.ky/how-drop-works/>** (the source of that page lives in
@@ -257,7 +257,7 @@ the macOS keychain (service names `publish-r2-access-key-id`,
 `publish-r2-secret-access-key`, `publish-admin-token`, overridable via the
 matching `PUBLISH_*_KEYCHAIN` vars; scope to a keychain account with
 `PUBLISH_KEYCHAIN_ACCOUNT`). Env vars are the portable path; the keychain is just
-a convenience on my own machine.
+a local convenience.
 
 Requirements: Python 3.10+ and `gitleaks` on `PATH` (plus `tesseract` if you
 publish images). Symlink `cli/publish` somewhere on your `PATH`.
