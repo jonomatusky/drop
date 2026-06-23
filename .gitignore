@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Node / wrangler
+node_modules/
+.wrangler/
+.dev.vars
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Local scratch
+*.tmp
+/tmp/

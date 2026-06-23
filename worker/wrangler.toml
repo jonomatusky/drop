@@ -1,0 +1,34 @@
+name = "drop"
+main = "src/worker.mjs"
+compatibility_date = "2026-06-22"
+workers_dev = true
+
+# Dedicated public-share host. `custom_domain = true` makes `wrangler deploy`
+# create and manage the DNS record + edge cert itself, so no manual DNS entry is
+# needed — the zone just has to be active in your Cloudflare account first.
+# `workers_dev` stays true so the *.workers.dev fallback (and any existing share)
+# keeps resolving. Drop this whole block to run on the *.workers.dev host alone.
+#   (my deployment uses drop.jonomatus.ky)
+routes = [
+  { pattern = "drop.example.com", custom_domain = true }
+]
+
+[[r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "publish-artifacts"
+
+[[kv_namespaces]]
+binding = "AUTH_KV"
+id = "<your-kv-namespace-id>"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "drop"
+database_id = "<your-d1-database-id>"
+
+[vars]
+# Used only to build cache-purge URLs on revoke; safe to leave pointing at your
+# public host. Optional CF_API_TOKEN + CF_ZONE_ID *secrets* enable the purge.
+PUBLIC_BASE_URL = "https://drop.example.com"
+RATE_LIMIT_MAX = "10"
+RATE_LIMIT_WINDOW_SECONDS = "60"

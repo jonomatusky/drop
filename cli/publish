@@ -1,0 +1,756 @@
+#!/usr/bin/env python3
+"""
+publish — static-artifact sharing CLI for a self-hosted `drop` deployment.
+
+The CLI owns the local no-leak preflight and orchestration. The Worker (see
+../worker) owns public serving, auth, expiry, revoke, and the canonical D1
+manifest.
+
+Configuration is via environment variables (a macOS keychain fallback is an
+optional convenience — see README.md):
+
+  Required
+    PUBLISH_BASE_URL            base URL of your deployed Worker, e.g.
+                                https://drop.example.com  (no trailing slash needed)
+    PUBLISH_CF_ACCOUNT_ID       your Cloudflare account id (an identifier, not a
+                                secret) — used to address R2's S3 endpoint
+    PUBLISH_R2_ACCESS_KEY_ID    S3 Access Key ID of a bucket-scoped R2
+                                "Object Read & Write" token
+    PUBLISH_R2_SECRET_ACCESS_KEY  the matching S3 secret
+    PUBLISH_ADMIN_TOKEN         bearer token gating the Worker's /admin/* routes
+
+  Optional
+    PUBLISH_R2_BUCKET           artifact bucket name (default: publish-artifacts)
+    PUBLISH_FORBIDDEN_R2_BUCKET a bucket the upload creds must NOT reach; enables
+                                the `publish scope-test` blast-radius check
+    PUBLISH_GITLEAKS_CONFIG     path to a gitleaks config (default: the bundled
+                                publish-gitleaks.toml next to this script)
+    PUBLISH_KEYCHAIN_ACCOUNT    macOS keychain account to read secrets under
+    PUBLISH_*_KEYCHAIN          override the keychain service name for each secret
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import hashlib
+import hmac
+import html.parser
+import json
+import mimetypes
+import os
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+# --- Configuration ---------------------------------------------------------
+
+DEFAULT_BUCKET = "publish-artifacts"
+# A bucket the upload creds must NOT be able to reach (proves bucket-scoping).
+# Optional: set PUBLISH_FORBIDDEN_R2_BUCKET to enable the `scope-test` check.
+# Example from my own setup: another app's prod bucket on the same account.
+DEFAULT_FORBIDDEN_R2_BUCKET = os.environ.get("PUBLISH_FORBIDDEN_R2_BUCKET", "")
+
+# Secret sources. Each reads $ENV first; if unset, falls back to the macOS
+# keychain (service name below, overridable via the matching *_KEYCHAIN env).
+R2_ACCESS_KEY_ENV = "PUBLISH_R2_ACCESS_KEY_ID"
+R2_SECRET_KEY_ENV = "PUBLISH_R2_SECRET_ACCESS_KEY"
+ADMIN_TOKEN_ENV = "PUBLISH_ADMIN_TOKEN"
+R2_ACCESS_KEY_KEYCHAIN = os.environ.get("PUBLISH_R2_ACCESS_KEY_ID_KEYCHAIN", "publish-r2-access-key-id")
+R2_SECRET_KEY_KEYCHAIN = os.environ.get("PUBLISH_R2_SECRET_ACCESS_KEY_KEYCHAIN", "publish-r2-secret-access-key")
+ADMIN_TOKEN_KEYCHAIN = os.environ.get("PUBLISH_ADMIN_TOKEN_KEYCHAIN", "publish-admin-token")
+
+DEFAULT_GITLEAKS_CONFIG = Path(__file__).resolve().parent / "publish-gitleaks.toml"
+
+SECRET_FILE_RE = re.compile(
+    r"(^|/)(\.env(\..*)?|\.npmrc|\.pypirc|id_rsa|id_dsa|id_ed25519|.*\.pem|.*\.key|credentials|secrets?)(/|$)",
+    re.IGNORECASE,
+)
+ARCHIVE_RE = re.compile(r"\.(zip|tar|tgz|tar\.gz|tar\.bz2|tar\.xz|7z|rar)$", re.IGNORECASE)
+IMAGE_RE = re.compile(r"\.(png|jpe?g|gif|webp|tiff?|bmp)$", re.IGNORECASE)
+TEXTISH_RE = re.compile(r"\.(html?|css|js|mjs|json|txt|md|csv|xml|svg|log|map|yaml|yml)$", re.IGNORECASE)
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+CREDENTIAL_RE = re.compile(r"\b(password|passwd|pwd|api[_-]?key|secret|token)\b\s*[:=]\s*['\"]?[^'\"\s]{8,}", re.IGNORECASE)
+URL_ATTRS = {"src", "href", "poster", "data", "action"}
+
+
+class PublishError(Exception):
+    pass
+
+
+class AssetParser(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.urls: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for key, value in attrs:
+            if key and key.lower() in URL_ATTRS and value and re.match(r"^https?://", value, re.I):
+                self.urls.append(value)
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"publish: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run(cmd: list[str], *, env: dict[str, str] | None = None, input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(cmd, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
+
+
+def _keychain_get(service: str) -> str | None:
+    """Optional macOS keychain convenience. Returns the secret or None.
+
+    Prefers a `kc-get <service>` helper on PATH if present, else falls back to
+    `security find-generic-password`. Set PUBLISH_KEYCHAIN_ACCOUNT to scope the
+    lookup to a specific keychain account.
+    """
+    helper = shutil.which("kc-get")
+    if helper:
+        proc = run([helper, service])
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.decode().strip()
+        return None
+    if sys.platform == "darwin" and shutil.which("security"):
+        cmd = ["security", "find-generic-password", "-s", service, "-w"]
+        account = os.environ.get("PUBLISH_KEYCHAIN_ACCOUNT")
+        if account:
+            cmd[1:1] = ["-a", account]
+        proc = run(cmd)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.decode().strip()
+    return None
+
+
+def get_secret(env_name: str, keychain_service: str, label: str) -> str:
+    """Env var first, then the optional keychain fallback. Errors clearly if
+    neither is set, so a stranger never has to read source to know what's missing."""
+    val = os.environ.get(env_name)
+    if val and val.strip():
+        return val.strip()
+    val = _keychain_get(keychain_service)
+    if val:
+        return val
+    raise PublishError(
+        f"missing {label}: set ${env_name} "
+        f"(or store it in the macOS keychain as '{keychain_service}')"
+    )
+
+
+def require_env(name: str, label: str) -> str:
+    val = os.environ.get(name)
+    if not val or not val.strip():
+        raise PublishError(f"missing {label}: set ${name}")
+    return val.strip()
+
+
+def base_url() -> str:
+    return require_env("PUBLISH_BASE_URL", "Worker base URL").rstrip("/")
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+
+def parse_duration(value: str) -> dt.datetime:
+    match = re.fullmatch(r"(\d+)([smhdw])", value.strip().lower())
+    if not match:
+        raise argparse.ArgumentTypeError("--expire must look like 30m, 7d, or 2w")
+    amount = int(match.group(1))
+    unit = match.group(2)
+    seconds = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit] * amount
+    return utc_now() + dt.timedelta(seconds=seconds)
+
+
+SLUG_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+# Unlisted ("secret link") shares have no password — the unguessable URL IS the
+# only gate, and public slugs are NOT rate-limited at the Worker (rate limiting
+# only fires on failed password auth). So the tail must be strong: 16 base36
+# chars ≈ 82 bits, far beyond any HTTP enumeration.
+SECRET_SLUG_LEN = 16
+
+
+def readable_slug(value: str) -> str:
+    """Human-readable slug: lowercase, hyphen-joined, no leading/trailing hyphen,
+    capped at 40 chars. Clean and id-free — uniqueness is handled separately, at
+    publish time, by resolve_unique_slug."""
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug[:40].strip("-")
+
+
+def generated_slug(readable_source: str | None, *, secret: bool = False) -> str:
+    """The slug for an artifact, e.g. ``ted-page`` — from --client/--label or the
+    artifact's file/dir name. ``secret=True`` (unlisted shares) appends an
+    unguessable ~82-bit tail (``ted-page-k7f3m9q2x8p4n6tz``) so the URL itself is
+    the capability. Otherwise it's a clean, id-free name; a clash is resolved by
+    resolve_unique_slug appending -2, -3 … at publish time."""
+    base = readable_slug(readable_source or "") or "share"
+    if secret:
+        tail = "".join(secrets.choice(SLUG_ALPHABET) for _ in range(SECRET_SLUG_LEN))
+        return f"{base}-{tail}"
+    return base
+
+
+def iter_files(path: Path) -> list[tuple[Path, str]]:
+    if not path.exists():
+        raise PublishError(f"path not found: {path}")
+    if path.is_file():
+        return [(path, path.name)]
+    if not path.is_dir():
+        raise PublishError(f"unsupported path: {path}")
+    root = path.resolve()
+    files: list[tuple[Path, str]] = []
+    for item in sorted(path.rglob("*")):
+        # A symlink (file or dir) inside the tree can resolve to a target
+        # outside the selected publish root and leak it under a harmless-looking
+        # relative name, bypassing the publish boundary and the filename guard.
+        # Reject any link that escapes the root; links that stay inside resolve
+        # to real files and are published normally (intentional aliases).
+        if item.is_symlink():
+            target = item.resolve()
+            if target != root and root not in target.parents:
+                rel = item.relative_to(path).as_posix()
+                raise PublishError(
+                    f"refusing to publish symlink that escapes the publish root: {rel} -> {target}"
+                )
+        if item.is_file():
+            rel = item.relative_to(path).as_posix()
+            files.append((item, rel))
+    if not files:
+        raise PublishError(f"no files to publish: {path}")
+    return files
+
+
+def scan_secret_filenames(files: list[tuple[Path, str]]) -> list[str]:
+    return [rel for _, rel in files if SECRET_FILE_RE.search(rel)]
+
+
+def scan_archives(files: list[tuple[Path, str]]) -> list[str]:
+    return [rel for _, rel in files if ARCHIVE_RE.search(rel)]
+
+
+def read_text(path: Path, max_bytes: int = 2_000_000) -> str:
+    data = path.read_bytes()[:max_bytes]
+    return data.decode("utf-8", errors="ignore")
+
+
+def pii_scan_text(text: str) -> tuple[list[str], list[str]]:
+    high: list[str] = []
+    warn: list[str] = []
+    emails = sorted(set(EMAIL_RE.findall(text)))
+    if len(emails) >= 10:
+        high.append(f"bulk email addresses ({len(emails)} unique)")
+    elif emails:
+        warn.append(f"email addresses ({len(emails)} unique)")
+    if SSN_RE.search(text):
+        high.append("SSN-like value")
+    if CREDENTIAL_RE.search(text):
+        high.append("credential-shaped assignment")
+    return high, warn
+
+
+def scan_pii(files: list[tuple[Path, str]]) -> tuple[list[str], list[str]]:
+    high: list[str] = []
+    warn: list[str] = []
+    for path, rel in files:
+        if TEXTISH_RE.search(rel):
+            h, w = pii_scan_text(read_text(path))
+            high.extend(f"{rel}: {item}" for item in h)
+            warn.extend(f"{rel}: {item}" for item in w)
+    return high, warn
+
+
+def run_gitleaks(path: Path) -> list[dict]:
+    gitleaks = shutil.which("gitleaks")
+    if not gitleaks:
+        raise PublishError("gitleaks is required for publish preflight (install it before publishing)")
+    config_path = Path(os.environ.get("PUBLISH_GITLEAKS_CONFIG", DEFAULT_GITLEAKS_CONFIG)).expanduser()
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as report:
+        report_path = Path(report.name)
+    try:
+        cmd = [gitleaks, "detect", "--no-git", "--source", str(path), "--report-format", "json", "--report-path", str(report_path)]
+        if config_path.exists():
+            cmd.extend(["--config", str(config_path)])
+        proc = run(cmd)
+        if report_path.exists() and report_path.stat().st_size:
+            try:
+                findings = json.loads(report_path.read_text())
+            except json.JSONDecodeError:
+                findings = [{"description": "gitleaks returned unreadable JSON"}]
+        else:
+            findings = []
+        if proc.returncode not in (0, 1):
+            stderr = proc.stderr.decode(errors="ignore").strip()
+            raise PublishError(f"gitleaks failed: {stderr or f'exit {proc.returncode}'}")
+        return findings if isinstance(findings, list) else [findings]
+    finally:
+        report_path.unlink(missing_ok=True)
+
+
+def scan_external_assets(files: list[tuple[Path, str]]) -> list[str]:
+    warnings: list[str] = []
+    for path, rel in files:
+        if not rel.lower().endswith((".html", ".htm")):
+            continue
+        parser = AssetParser()
+        try:
+            parser.feed(read_text(path))
+        except Exception:
+            continue
+        for url in sorted(set(parser.urls)):
+            warnings.append(f"{rel}: external asset {url}")
+    return warnings
+
+
+def scan_images(files: list[tuple[Path, str]], confirm_limitation: bool) -> tuple[list[str], list[str], list[str]]:
+    images = [(path, rel) for path, rel in files if IMAGE_RE.search(rel)]
+    if not images:
+        return [], [], []
+    tesseract = shutil.which("tesseract")
+    if not tesseract:
+        if not confirm_limitation:
+            raise PublishError("image files are present but OCR is unavailable; rerun with --confirm-image-limitation after reviewing them manually")
+        return [], [f"image contents not OCR-scanned ({len(images)} image files; explicit limitation accepted)"], []
+    high: list[str] = []
+    warn: list[str] = []
+    ocr_paths: list[str] = []
+    for path, rel in images:
+        proc = run([tesseract, str(path), "stdout"])
+        if proc.returncode != 0:
+            if not confirm_limitation:
+                raise PublishError(f"OCR failed for {rel}; rerun with --confirm-image-limitation after manual review")
+            warn.append(f"{rel}: OCR failed; explicit limitation accepted")
+            continue
+        ocr_paths.append(rel)
+        h, w = pii_scan_text(proc.stdout.decode("utf-8", errors="ignore"))
+        high.extend(f"{rel} OCR: {item}" for item in h)
+        warn.extend(f"{rel} OCR: {item}" for item in w)
+    return high, warn, ocr_paths
+
+
+def public_confirm(args: argparse.Namespace) -> None:
+    if args.yes:
+        return
+    prompt = (
+        "This artifact goes on the public internet. It may be cached, indexed, "
+        "forwarded, and survive deletion. Type 'publish' to continue: "
+    )
+    if not sys.stdin.isatty():
+        raise PublishError("refusing non-interactive publish without --yes")
+    if input(prompt).strip() != "publish":
+        raise PublishError("publish cancelled")
+
+
+def preflight(path: Path, files: list[tuple[Path, str]], args: argparse.Namespace) -> dict:
+    blocks: list[str] = []
+    warnings: list[str] = []
+    override_log: list[dict] = []
+
+    secret_names = scan_secret_filenames(files)
+    if secret_names:
+        blocks.extend(f"secret filename: {name}" for name in secret_names)
+
+    archives = scan_archives(files)
+    if archives:
+        blocks.extend(f"archive blocked in v1: {name}" for name in archives)
+
+    gitleaks_findings = run_gitleaks(path)
+    if gitleaks_findings:
+        if args.allow_secret:
+            override_log.append({"type": "secret", "reason": args.allow_secret})
+            warnings.append(f"gitleaks findings overridden ({len(gitleaks_findings)})")
+        else:
+            blocks.append(f"gitleaks secret findings: {len(gitleaks_findings)}")
+
+    pii_high, pii_warn = scan_pii(files)
+    warnings.extend(pii_warn)
+    if pii_high:
+        if args.allow_pii:
+            override_log.append({"type": "pii", "reason": args.allow_pii})
+            warnings.extend(f"PII override: {item}" for item in pii_high)
+        else:
+            blocks.extend(f"high-confidence PII: {item}" for item in pii_high)
+
+    image_high, image_warn, ocr_paths = scan_images(files, args.confirm_image_limitation)
+    warnings.extend(image_warn)
+    if image_high:
+        if args.allow_pii:
+            override_log.append({"type": "image-pii", "reason": args.allow_pii})
+            warnings.extend(f"image PII override: {item}" for item in image_high)
+        else:
+            blocks.extend(f"high-confidence image PII: {item}" for item in image_high)
+
+    warnings.extend(scan_external_assets(files))
+
+    if blocks:
+        raise PublishError("preflight blocked:\n  - " + "\n  - ".join(blocks))
+
+    return {
+        "status": "passed",
+        "warnings": warnings,
+        "gitleaks_findings": len(gitleaks_findings),
+        "secret_filename_hits": secret_names,
+        "ocr_scanned": ocr_paths,
+        "image_limitation_accepted": bool(image_warn and args.confirm_image_limitation),
+        "override_log": [
+            {**item, "actor": _actor(), "host": socket.gethostname(), "at": utc_now().isoformat()}
+            for item in override_log
+        ],
+    }
+
+
+def _actor() -> str:
+    """A best-effort uploader identity for the audit trail (no hard dependency on
+    a populated passwd entry, which can be empty in containers)."""
+    return os.environ.get("PUBLISH_ACTOR") or os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
+
+
+def digest_files(files: list[tuple[Path, str]]) -> tuple[str, int, list[dict]]:
+    sha = hashlib.sha256()
+    total = 0
+    file_rows: list[dict] = []
+    for path, rel in files:
+        file_sha = hashlib.sha256()
+        size = path.stat().st_size
+        total += size
+        sha.update(rel.encode())
+        sha.update(b"\0")
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                sha.update(chunk)
+                file_sha.update(chunk)
+        file_rows.append({"path": rel, "bytes": size, "sha256": file_sha.hexdigest(), "content_type": mimetypes.guess_type(rel)[0] or "application/octet-stream"})
+    return sha.hexdigest(), total, file_rows
+
+
+def password_verifier(password: str) -> dict:
+    salt = secrets.token_bytes(16)
+    # Cloudflare Workers' WebCrypto caps PBKDF2 at 100k iterations (it throws
+    # NotSupportedError above that), and the Worker verifies with this same count,
+    # so it must stay <= 100000. 100k is the strongest the runtime allows.
+    iterations = 100_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return {
+        "algorithm": "pbkdf2-sha256",
+        "iterations": iterations,
+        "salt": base64.b64encode(salt).decode(),
+        "hash": digest.hex(),
+    }
+
+
+def admin_request(method: str, path: str, token: str, payload: dict | None = None) -> dict:
+    base = base_url()
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            # Cloudflare's edge 1010-blocks python-urllib's default UA on some paths.
+            "User-Agent": "publish-cli/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode()
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as err:
+        body = err.read().decode(errors="ignore")
+        raise PublishError(f"admin API {method} {path} -> HTTP {err.code}: {body.strip() or '<empty>'}") from err
+    except urllib.error.URLError as err:
+        raise PublishError(f"admin API unavailable: {err}") from err
+
+
+def _r2_account_id() -> str:
+    return require_env("PUBLISH_CF_ACCOUNT_ID", "Cloudflare account id")
+
+
+def s3_request(
+    method: str,
+    bucket: str,
+    key: str = "",
+    *,
+    body: bytes = b"",
+    query: str = "",
+    content_type: str | None = None,
+    timeout: int = 60,
+) -> tuple[int, bytes]:
+    """Signed (AWS SigV4) request to R2's S3 endpoint with the bucket-scoped
+    publish creds. Returns (status, response_body); HTTP errors are returned, not
+    raised, so callers can assert on the status (e.g. scope-test wants 403)."""
+    access_key = get_secret(R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_KEYCHAIN, "R2 S3 access key id")
+    secret = get_secret(R2_SECRET_KEY_ENV, R2_SECRET_KEY_KEYCHAIN, "R2 S3 secret access key")
+    host = f"{_r2_account_id()}.r2.cloudflarestorage.com"
+    region, service = "auto", "s3"
+    now = utc_now()
+    amzdate = now.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = now.strftime("%Y%m%d")
+    payload_hash = hashlib.sha256(body).hexdigest()
+    canonical_uri = f"/{bucket}/{key}" if key else f"/{bucket}/"
+
+    headers = {"host": host, "x-amz-content-sha256": payload_hash, "x-amz-date": amzdate}
+    if content_type:
+        headers["content-type"] = content_type
+    signed_headers = ";".join(sorted(headers))
+    canonical_headers = "".join(f"{name}:{headers[name]}\n" for name in sorted(headers))
+    canonical_request = f"{method}\n{canonical_uri}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+
+    scope = f"{datestamp}/{region}/{service}/aws4_request"
+    string_to_sign = (
+        f"AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n"
+        f"{hashlib.sha256(canonical_request.encode()).hexdigest()}"
+    )
+
+    def _sign(key_bytes: bytes, msg: str) -> bytes:
+        return hmac.new(key_bytes, msg.encode(), hashlib.sha256).digest()
+
+    signing_key = _sign(_sign(_sign(_sign(f"AWS4{secret}".encode(), datestamp), region), service), "aws4_request")
+    signature = hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    authorization = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+    url = f"https://{host}{canonical_uri}" + (f"?{query}" if query else "")
+    req_headers = {
+        "Host": host,
+        "x-amz-date": amzdate,
+        "x-amz-content-sha256": payload_hash,
+        "Authorization": authorization,
+    }
+    if content_type:
+        req_headers["Content-Type"] = content_type
+    req = urllib.request.Request(
+        url, data=body if method in ("PUT", "POST") else None, method=method, headers=req_headers
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+    except urllib.error.URLError as err:
+        raise PublishError(f"R2 S3 request failed: {err}") from err
+
+
+def upload_r2(files: list[tuple[Path, str]], slug: str) -> None:
+    bucket = os.environ.get("PUBLISH_R2_BUCKET", DEFAULT_BUCKET)
+    for path, rel in files:
+        key = f"{slug}/{rel}"
+        content_type = mimetypes.guess_type(rel)[0] or "application/octet-stream"
+        status, response = s3_request("PUT", bucket, key, body=path.read_bytes(), content_type=content_type)
+        if status not in (200, 201):
+            raise PublishError(f"R2 upload failed for {rel}: HTTP {status}: {response.decode(errors='ignore')[:200]}")
+
+
+def resolve_unique_slug(base: str, admin_token: str) -> str:
+    """Pick a free, readable slug: the base name if available, else base-2,
+    base-3, … Every existing share counts as taken — including expired and
+    revoked ones — so a new artifact never reuses or silently overwrites a name
+    that has already been published."""
+    data = admin_request("GET", "/admin/list", admin_token)
+    taken = {row.get("slug") for row in data.get("shares", [])}
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base}-{n}" in taken:
+        n += 1
+    return f"{base}-{n}"
+
+
+def cmd_publish(args: argparse.Namespace) -> None:
+    # Reject contradictory tier combinations up front, before any slow work — a
+    # silently-ignored flag here means a share the user believes is gated but
+    # isn't. (--public/--unlisted are already mutually exclusive via argparse.)
+    if (args.public or args.unlisted) and args.password:
+        raise PublishError("--password has no effect on --public/--unlisted shares (those tiers have no password); drop one")
+    if args.unlisted and args.slug:
+        raise PublishError("--slug defeats --unlisted's unguessable tail, leaving an open guessable URL; use one or the other")
+
+    path = Path(args.path).expanduser().resolve()
+    files = iter_files(path)
+    scan_result = preflight(path, files, args)
+    public_confirm(args)
+
+    # Three visibility tiers (YouTube-style):
+    #   default   → password-protected ("draft"): clean readable slug + a password.
+    #   --unlisted→ "secret link": no password, but an unguessable slug tail is the
+    #               capability — anyone with the link views, nobody can guess it.
+    #   --public  → truly public: no password, clean guessable slug (discoverable).
+    # To the Worker, --unlisted and --public are both auth_mode="public"; the only
+    # difference is the slug (the entropy tail), which is purely CLI-side.
+    no_password = args.public or args.unlisted
+    auth_mode = "public" if no_password else "password"
+    # Readable slug source: an explicit label wins, else the artifact's own
+    # file/dir name (a file's extension is dropped — `report.html` -> `report`).
+    base_name = path.stem if path.is_file() else path.name
+    slug = args.slug or generated_slug(args.client or args.label or base_name, secret=args.unlisted)
+    password = None if no_password else (args.password or secrets.token_urlsafe(18))
+    artifact_sha, total_bytes, file_rows = digest_files(files)
+    created_at = utc_now().isoformat()
+    manifest = {
+        "slug": slug,
+        "label": args.client or args.label,
+        "auth_mode": auth_mode,
+        "sha256": artifact_sha,
+        "files": file_rows,
+        "bytes": total_bytes,
+        "scan_result": scan_result,
+        "created_at": created_at,
+        "expires_at": args.expire.isoformat() if args.expire else None,
+        "uploader": f"{_actor()}@{socket.gethostname()}",
+        "override_log": scan_result["override_log"],
+    }
+    if password:
+        manifest["password_verifier"] = password_verifier(password)
+
+    base = base_url()
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, "url": f"{base}/{slug}/", "manifest": manifest}, indent=2))
+        return
+
+    admin_token = get_secret(ADMIN_TOKEN_ENV, ADMIN_TOKEN_KEYCHAIN, "Worker admin token")
+    # Auto-generated readable slugs get a unique name on clash (ted-page-2, …);
+    # an explicit --slug is honored as-is so a known share republishes in place.
+    if not args.slug:
+        slug = resolve_unique_slug(slug, admin_token)
+        manifest["slug"] = slug
+    upload_r2(files, slug)
+    admin_request("POST", "/admin/manifest", admin_token, manifest)
+
+    print(f"url: {base}/{slug}/")
+    if password:
+        print(f"password: {password}")
+    if scan_result["warnings"]:
+        print("warnings:", file=sys.stderr)
+        for warning in scan_result["warnings"]:
+            print(f"  - {warning}", file=sys.stderr)
+
+
+def cmd_list(_: argparse.Namespace) -> None:
+    token = get_secret(ADMIN_TOKEN_ENV, ADMIN_TOKEN_KEYCHAIN, "Worker admin token")
+    data = admin_request("GET", "/admin/list", token)
+    shares = data.get("shares", [])
+    if not shares:
+        return
+    for row in shares:
+        revoked = " revoked" if row.get("revoked_at") else ""
+        expires = f" expires={row['expires_at']}" if row.get("expires_at") else ""
+        label = f" label={row['label']}" if row.get("label") else ""
+        print(f"{row['slug']} {row['auth_mode']} bytes={row['bytes']}{label}{expires}{revoked}")
+
+
+def cmd_revoke(args: argparse.Namespace) -> None:
+    token = get_secret(ADMIN_TOKEN_ENV, ADMIN_TOKEN_KEYCHAIN, "Worker admin token")
+    data = admin_request("POST", "/admin/revoke", token, {"slug": args.slug, "actor": f"{_actor()}@{socket.gethostname()}"})
+    print(f"revoked {data.get('slug', args.slug)} deleted={data.get('deleted', 0)}")
+
+
+def cmd_scope_test(_: argparse.Namespace) -> None:
+    """Prove the publish upload creds are bucket-scoped: they must be able to write
+    our own bucket but be denied (401/403) on a known forbidden bucket. This tests
+    the credentials actually used for uploads, over the same S3 path they use.
+
+    Set PUBLISH_FORBIDDEN_R2_BUCKET to a bucket on the same account that the
+    upload creds must NOT reach (e.g. another app's bucket)."""
+    bucket = os.environ.get("PUBLISH_R2_BUCKET", DEFAULT_BUCKET)
+    forbidden = os.environ.get("PUBLISH_FORBIDDEN_R2_BUCKET", DEFAULT_FORBIDDEN_R2_BUCKET)
+    failures: list[str] = []
+
+    # 1) The forbidden bucket must be unreachable (skipped if none configured).
+    status = None
+    if forbidden:
+        status, _ = s3_request("GET", forbidden, query="list-type=2&max-keys=1")
+        if status not in (401, 403):
+            failures.append(f"S3 read of forbidden bucket '{forbidden}' returned HTTP {status}; expected 401/403")
+    else:
+        print("scope-test: no PUBLISH_FORBIDDEN_R2_BUCKET set; skipping the forbidden-bucket check", file=sys.stderr)
+
+    # 2) Our own bucket must be writable (proves the creds are valid, not just dead).
+    probe_key = "scope-test/probe.txt"
+    put_status, put_body = s3_request("PUT", bucket, probe_key, body=b"scope-test\n", content_type="text/plain")
+    if put_status not in (200, 201):
+        failures.append(f"S3 write to own bucket '{bucket}' returned HTTP {put_status}: {put_body.decode(errors='ignore')[:120]}")
+    else:
+        s3_request("DELETE", bucket, probe_key)  # best-effort cleanup
+
+    if failures:
+        raise PublishError("scope-test failed:\n  - " + "\n  - ".join(failures))
+    if forbidden:
+        print(f"scope-test passed: upload creds write '{bucket}' OK and are denied on '{forbidden}' (HTTP {status})")
+    else:
+        print(f"scope-test passed: upload creds write '{bucket}' OK (no forbidden bucket configured to deny-check)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="publish")
+    parser.add_argument("--client", help="client/recipient label; sets the readable slug (default: the file/dir name)")
+    parser.add_argument("--label", help="internal label when --client is not appropriate; also sets the readable slug")
+    # Visibility (default = password-protected). --public and --unlisted both drop
+    # the password; they differ only in the slug (guessable vs unguessable).
+    visibility = parser.add_mutually_exclusive_group()
+    visibility.add_argument("--public", action="store_true", help="truly public: no password, clean guessable URL (discoverable)")
+    visibility.add_argument("--unlisted", action="store_true", help="secret link: no password, unguessable URL — share the link directly")
+    parser.add_argument("--password", help="set an explicit password instead of generating one (password tier only)")
+    parser.add_argument("--expire", type=parse_duration, help="server-side expiry duration, e.g. 7d")
+    parser.add_argument("--slug", help=argparse.SUPPRESS)
+    parser.add_argument("--allow-secret", metavar="REASON", help="override gitleaks findings; reason is logged")
+    parser.add_argument("--allow-pii", metavar="REASON", help="override high-confidence PII findings; reason is logged")
+    parser.add_argument("--confirm-image-limitation", action="store_true", help="accept manual review when OCR is unavailable or fails")
+    parser.add_argument("--yes", action="store_true", help="accept the final public-internet confirmation")
+    parser.add_argument("--dry-run", action="store_true", help="run preflight and print the manifest without uploading")
+    parser.add_argument("path", nargs="?", help="file or directory to publish")
+    parser.set_defaults(func=cmd_publish)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "list":
+        try:
+            cmd_list(argparse.Namespace())
+            return 0
+        except PublishError as err:
+            die(str(err))
+    if argv and argv[0] == "revoke":
+        if len(argv) != 2:
+            die("usage: publish revoke <slug>", code=2)
+        try:
+            cmd_revoke(argparse.Namespace(slug=argv[1]))
+            return 0
+        except PublishError as err:
+            die(str(err))
+    if argv and argv[0] == "scope-test":
+        try:
+            cmd_scope_test(argparse.Namespace())
+            return 0
+        except PublishError as err:
+            die(str(err))
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        if not args.path:
+            parser.error("missing path")
+        args.func(args)
+        return 0
+    except PublishError as err:
+        die(str(err))
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

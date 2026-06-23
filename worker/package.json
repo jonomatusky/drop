@@ -1,0 +1,12 @@
+{
+  "name": "drop-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Edge Worker for the drop static-artifact publisher (Cloudflare Workers + R2 + D1)",
+  "scripts": {
+    "test": "node test/worker.test.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "license": "MIT"
+}

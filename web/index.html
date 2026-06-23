@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How drop.jonomatus.ky works</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --panel: #12151d;
+    --panel-2: #161a24;
+    --line: #232938;
+    --ink: #e8ebf2;
+    --ink-dim: #9aa3b8;
+    --ink-faint: #6b7280;
+    --accent: #7aa2ff;
+    --accent-2: #5ce0c0;
+    --warn: #ffb86b;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1100px 600px at 78% -8%, rgba(122,162,255,0.10), transparent 60%),
+      radial-gradient(900px 520px at 8% 4%, rgba(92,224,192,0.07), transparent 55%),
+      var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 0 24px 120px; }
+
+  /* Hero */
+  header.hero { padding: 76px 0 30px; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent-2);
+    margin: 0 0 18px;
+  }
+  h1 {
+    font-size: clamp(34px, 6vw, 52px);
+    line-height: 1.08;
+    letter-spacing: -0.02em;
+    margin: 0 0 18px;
+    font-weight: 680;
+  }
+  h1 .host { color: var(--accent); }
+  .lede {
+    font-size: clamp(17px, 2.4vw, 20px);
+    color: var(--ink-dim);
+    max-width: 64ch;
+    margin: 0 0 26px;
+  }
+  .url-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--ink);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 9px 16px;
+  }
+  .url-pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-2); box-shadow: 0 0 0 4px rgba(92,224,192,0.14); }
+
+  .note {
+    margin-top: 30px;
+    font-size: 14.5px;
+    color: var(--ink-dim);
+    border-left: 2px solid var(--line);
+    padding: 4px 0 4px 16px;
+  }
+  .note strong { color: var(--ink); font-weight: 620; }
+
+  /* Sections */
+  section { margin-top: 56px; }
+  h2 {
+    font-size: 13px;
+    font-family: var(--mono);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    margin: 0 0 8px;
+  }
+  h3 {
+    font-size: 25px;
+    letter-spacing: -0.015em;
+    margin: 4px 0 16px;
+    font-weight: 640;
+  }
+  p { margin: 0 0 16px; color: var(--ink); }
+  p.muted { color: var(--ink-dim); }
+  a { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(122,162,255,0.3); }
+  a:hover { border-bottom-color: var(--accent); }
+
+  /* Flow diagram */
+  .flow {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 14px;
+    margin: 22px 0 8px;
+  }
+  .flow-step {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 18px 20px;
+    position: relative;
+  }
+  .flow-step .k {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--accent-2);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .flow-step h4 { margin: 6px 0 6px; font-size: 17px; font-weight: 620; }
+  .flow-step p { margin: 0; font-size: 14.5px; color: var(--ink-dim); }
+  .flow-arrow { text-align: center; color: var(--ink-dim); font-size: 18px; line-height: 0.5; }
+
+  /* code */
+  code {
+    font-family: var(--mono);
+    font-size: 0.88em;
+    background: rgba(122,162,255,0.10);
+    border: 1px solid rgba(122,162,255,0.16);
+    border-radius: 6px;
+    padding: 1px 6px;
+    color: #cdd9ff;
+  }
+  pre {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 18px 20px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13.5px;
+    line-height: 1.7;
+    color: var(--ink);
+    margin: 18px 0;
+  }
+  pre code { background: none; border: none; padding: 0; color: inherit; font-size: inherit; }
+  pre .c { color: var(--ink-dim); }
+  pre .f { color: var(--accent-2); }
+
+  /* Tier table */
+  .tiers { display: grid; gap: 14px; margin: 22px 0; }
+  .tier {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 20px 22px;
+  }
+  .tier-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .tier-name { font-size: 18px; font-weight: 640; }
+  .tier-flag { font-family: var(--mono); font-size: 13px; color: var(--accent); }
+  .tier p { margin: 10px 0 0; font-size: 14.5px; color: var(--ink-dim); }
+  .tier .slug { font-family: var(--mono); font-size: 13px; color: var(--ink); margin-top: 12px; word-break: break-all; }
+  .tier .slug .tail { color: var(--warn); }
+
+  /* Highlight panel (standout) */
+  .highlight {
+    background: linear-gradient(180deg, rgba(122,162,255,0.07), rgba(92,224,192,0.04));
+    border: 1px solid rgba(122,162,255,0.25);
+    border-radius: 18px;
+    padding: 28px 28px 8px;
+    margin-top: 22px;
+  }
+  .highlight h3 { margin-top: 0; }
+  .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 18px 0 22px; }
+  .card {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }
+  .card .lbl { font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-dim); }
+  .card.good .lbl { color: var(--accent-2); }
+  .card.bad .lbl { color: #ff8a8a; }
+  .card p { margin: 8px 0 0; font-size: 14px; color: var(--ink); }
+
+  /* feature grid */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 22px 0; }
+  .feat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; }
+  .feat h4 { margin: 0 0 6px; font-size: 15.5px; font-weight: 620; }
+  .feat p { margin: 0; font-size: 13.5px; color: var(--ink-dim); }
+
+  ul.clean { list-style: none; padding: 0; margin: 18px 0; }
+  ul.clean li { padding: 10px 0 10px 26px; position: relative; border-bottom: 1px solid var(--line); color: var(--ink-dim); font-size: 15px; }
+  ul.clean li:last-child { border-bottom: none; }
+  ul.clean li::before { content: "→"; position: absolute; left: 0; color: var(--accent-2); }
+  ul.clean li strong { color: var(--ink); font-weight: 600; }
+
+  footer {
+    margin-top: 70px;
+    padding-top: 26px;
+    border-top: 1px solid var(--line);
+    color: var(--ink-dim);
+    font-size: 13.5px;
+  }
+  footer .meta { font-family: var(--mono); font-size: 12.5px; color: var(--ink-dim); }
+
+  @media (max-width: 620px) {
+    body { font-size: 16px; }
+    .twocol, .grid { grid-template-columns: 1fr; }
+    header.hero { padding: 56px 0 20px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <p class="eyebrow">A static-artifact publishing pipeline</p>
+    <h1>How <span class="host">drop.jonomatus.ky</span> works</h1>
+    <p class="lede">
+      One command turns a local HTML file, report, or screenshot bundle into a clean
+      public URL on the open internet — with a password gate, expiry, revocation, and
+      an audit trail behind it. Here is the whole machine.
+    </p>
+    <span class="url-pill"><span class="dot"></span> drop.jonomatus.ky/&lt;slug&gt;/</span>
+    <p class="note">
+      <strong>What this is:</strong> a personal, self-hosted tool built by
+      <a href="https://x.com/jonomatusky">jonomatusky</a> and run on his own
+      Cloudflare account. It is not a product you can sign up for — this page just explains the
+      design, because the design has a few details worth showing. (This very page was published
+      with the tool it describes.) The code is open source:
+      <a href="https://github.com/jonomatusky/drop">github.com/jonomatusky/drop</a>.
+    </p>
+  </header>
+
+  <!-- THE SPLIT -->
+  <section>
+    <h2>Architecture</h2>
+    <h3>A thin CLI and a small Worker</h3>
+    <p>
+      The system is two halves with a clean seam between them. A local command-line tool does all
+      the work that needs your machine — scanning, hashing, uploading. A Cloudflare Worker at the
+      edge does all the work that needs to be live 24/7 — serving pages, checking passwords,
+      honoring expiry. Neither half holds more power than its job requires.
+    </p>
+
+    <div class="flow">
+      <div class="flow-step">
+        <span class="k">Local · the CLI</span>
+        <h4><code>publish path/to/artifact</code></h4>
+        <p>Runs a no-leak preflight, resolves a readable slug, uploads each file as an object to R2 storage, then calls the Worker's admin API to write the canonical manifest for the share.</p>
+      </div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-step">
+        <span class="k">Object storage · R2</span>
+        <h4>Files land in <code>merit-publish-artifacts</code></h4>
+        <p>Cloudflare R2 holds the raw bytes of every published file. The CLI writes them; the Worker reads them. Nothing is served from your machine.</p>
+      </div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-step">
+        <span class="k">Edge · the Worker</span>
+        <h4>Serves <code>/&lt;slug&gt;/…</code> from R2</h4>
+        <p>On every request it looks up the manifest in a D1 database, enforces the auth mode, checks expiry and revocation, sets <code>no-index</code> headers, and streams the object back — logging the access.</p>
+      </div>
+    </div>
+
+    <p class="muted">
+      The split is also a security boundary. The deployed Worker carries <em>no</em> API token at
+      all — it reaches R2 and the database through Cloudflare <em>bindings</em>, so no broad
+      credential is ever left sitting on the edge.
+    </p>
+  </section>
+
+  <!-- STORAGE + AUDIT -->
+  <section>
+    <h2>State</h2>
+    <h3>R2 for the bytes, D1 for the record</h3>
+    <p>
+      Storage and bookkeeping are kept separate. <strong>R2</strong> is the object store — it holds
+      the actual file contents. <strong>D1</strong> (Cloudflare's edge SQLite) holds the
+      <em>metadata</em>: one row per share and an append-only audit log.
+    </p>
+    <div class="grid">
+      <div class="feat">
+        <h4>The share manifest</h4>
+        <p>Each share is a row: its slug, auth mode, content hash, file list, byte count, the preflight scan result, plus created / expiry / revoked timestamps and who uploaded it.</p>
+      </div>
+      <div class="feat">
+        <h4>The audit trail</h4>
+        <p>A separate <code>audit_events</code> table records what happened to each share over time — creation, access, revocation — as an immutable, append-only history keyed by slug.</p>
+      </div>
+    </div>
+    <p class="muted">
+      Because the manifest carries an expiry and a revocation timestamp, a share can be switched off
+      (<code>publish revoke &lt;slug&gt;</code>) or made to lapse without touching the stored files —
+      the Worker simply refuses to serve a slug the database says is dead.
+    </p>
+  </section>
+
+  <!-- SLUGS -->
+  <section>
+    <h2>Naming</h2>
+    <h3>Readable slugs, no random IDs</h3>
+    <p>
+      Shares get short, human-readable URLs — <code>drop.jonomatus.ky/ted-page/</code>, not a wall
+      of hex. The slug comes from a <code>--client</code> or <code>--label</code> you pass, or, if
+      you pass neither, the artifact's own filename (<code>report.html</code> → <code>report</code>).
+      It is lowercased, hyphen-joined, and capped at 40 characters.
+    </p>
+    <p>
+      The interesting part is how name collisions are handled: <strong>at publish time, not with a
+      random suffix.</strong> The CLI asks the Worker for the list of existing shares and takes the
+      readable name if it's free. If it's taken, it appends <code>-2</code>, <code>-3</code>, and so
+      on — <code>ted-page-2</code>.
+    </p>
+    <ul class="clean">
+      <li><strong>Every</strong> existing share counts as taken — including expired and revoked ones — so a new artifact never silently overwrites a name that was used before.</li>
+      <li>The Worker stores by slug (an upsert), which is exactly <strong>why the CLI owns clash-avoidance</strong>: the edge would happily overwrite, so the client makes sure it never has to.</li>
+      <li>The result is URLs you can read aloud, with no UUID noise — and no accidental clobbering.</li>
+    </ul>
+  </section>
+
+  <!-- VISIBILITY TIERS -->
+  <section>
+    <h2>Access</h2>
+    <h3>Three visibility tiers</h3>
+    <p>
+      Borrowing YouTube's model, a share is one of three things. To the Worker there are really only
+      two auth modes — <code>password</code> and <code>public</code> — and the third tier is purely a
+      difference in how the slug is shaped.
+    </p>
+
+    <div class="tiers">
+      <div class="tier">
+        <div class="tier-head">
+          <span class="tier-name">Private <span style="color:var(--ink-dim);font-weight:400;font-size:14px">· default</span></span>
+          <span class="tier-flag">(no flag)</span>
+        </div>
+        <p>Password-protected. The slug is just a label; the password is the lock, so a guessable name
+          leaks nothing. The password is verified server-side and sent out-of-band. This is what you
+          get if you pass no visibility flag at all.</p>
+        <div class="slug">drop.jonomatus.ky/acme-proposal/ <span style="color:var(--ink-dim)">+ password</span></div>
+      </div>
+
+      <div class="tier">
+        <div class="tier-head">
+          <span class="tier-name">Unlisted</span>
+          <span class="tier-flag">--unlisted</span>
+        </div>
+        <p>No password, but the slug gets an unguessable ~82-bit random tail. <em>The URL is the
+          capability</em> — anyone with the link gets in, nobody can enumerate their way to it. Strong
+          entropy matters here because the Worker only rate-limits failed password attempts, so a
+          no-password share isn't throttled.</p>
+        <div class="slug">drop.jonomatus.ky/acme-proposal-<span class="tail">k7f3m9q2x8p4n6tz</span>/</div>
+      </div>
+
+      <div class="tier">
+        <div class="tier-head">
+          <span class="tier-name">Public</span>
+          <span class="tier-flag">--public</span>
+        </div>
+        <p>No password, clean guessable slug — for content meant to be found and shared. To the Worker
+          it's identical to unlisted (<code>auth_mode="public"</code>); the only difference is the
+          short, readable slug. <strong>This page was published this way.</strong></p>
+        <div class="slug">drop.jonomatus.ky/about/</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- THE STANDOUT: TOKEN MODEL -->
+  <section>
+    <div class="highlight">
+      <h2>The load-bearing detail</h2>
+      <h3>A bucket-scoped R2 token, over S3</h3>
+      <p>
+        The most deliberate design choice is about <em>blast radius</em>. The Cloudflare account
+        behind this also runs other things — another app's storage, databases, and Workers. So the
+        credential that <code>publish</code> uses for its constant job — uploading files on every run
+        — is scoped down to exactly one bucket and nothing else.
+      </p>
+      <p>
+        That scoping forces an unusual technical path, and it's worth understanding why:
+      </p>
+      <pre><code><span class="c"># The obvious command won't do:</span>
+wrangler r2 object put …
+  <span class="c">↳ hits Cloudflare's REST API</span>
+  <span class="c">↳ which only accepts an R2 *Admin* token</span>
+  <span class="c">↳ and Admin tokens are account-wide — they CANNOT be</span>
+  <span class="c">  scoped to a single bucket.</span>
+
+<span class="c"># So the CLI uploads a different way:</span>
+<span class="f">S3 PUT (SigV4)</span> with an <span class="f">Object Read &amp; Write</span> token
+  <span class="c">↳ Object R/W tokens ARE bucket-scopeable</span>
+  <span class="c">↳ their credential is an S3 Access Key ID + Secret</span>
+  <span class="c">↳ scoped to merit-publish-artifacts only</span></code></pre>
+      <p>
+        In short: the only Cloudflare token type that can be locked to a single bucket is an
+        <strong>Object Read &amp; Write</strong> token, and that token speaks <strong>S3</strong>, not
+        Cloudflare's REST API. So the CLI uploads with an S3 SigV4 <code>PUT</code> — trading the
+        convenient wrangler command for a credential that simply cannot reach anything it shouldn't.
+      </p>
+
+      <div class="twocol">
+        <div class="card good">
+          <span class="lbl">✓ Can</span>
+          <p>Write objects into <code>merit-publish-artifacts</code> — the one bucket this tool owns.</p>
+        </div>
+        <div class="card bad">
+          <span class="lbl">✗ Cannot</span>
+          <p>Touch any other bucket, database, or Worker on the account. A leak of this key exposes only published artifacts.</p>
+        </div>
+      </div>
+
+      <p style="font-size:14.5px;color:var(--ink-dim);padding-bottom:18px;">
+        There's even a self-test for it. <code>publish scope-test</code> uses the upload key to prove
+        it <em>can</em> write the artifacts bucket and is <em>denied</em> (401/403) on a known
+        forbidden bucket. If the forbidden bucket is ever readable, the token is mis-scoped and the
+        check fails loudly.
+      </p>
+    </div>
+  </section>
+
+  <!-- SAFETY -->
+  <section>
+    <h2>Before anything leaves the machine</h2>
+    <h3>A no-leak preflight</h3>
+    <p>
+      Publishing is one-way — public, forwardable, cacheable, and able to outlive a delete. So every
+      run is gated by a local scan <em>before</em> a single byte is uploaded:
+    </p>
+    <ul class="clean">
+      <li><strong>Secret scan.</strong> A <code>gitleaks</code> content pass blocks anything that looks like a key or token.</li>
+      <li><strong>Dangerous filenames.</strong> <code>.env</code>, private keys, and credential paths are refused by name.</li>
+      <li><strong>PII.</strong> High-confidence personal data blocks unless explicitly overridden with a logged reason.</li>
+      <li><strong>Images.</strong> OCR-scanned when tooling is available; otherwise you must accept the limitation after a manual look.</li>
+      <li><strong>Trackers &amp; archives.</strong> External scripts and tracking pixels warn; archive files are blocked outright.</li>
+      <li><strong>Final confirmation.</strong> A last prompt reminds you the artifact is public and may survive deletion.</li>
+    </ul>
+    <p class="muted">
+      Passwords, when used, are hashed with PBKDF2 at 100,000 iterations — the ceiling Cloudflare's
+      WebCrypto allows in a Worker — and the CLI and Worker are kept in lockstep on that count so a
+      verifier minted on one side always checks out on the other.
+    </p>
+  </section>
+
+  <!-- THE WHOLE THING -->
+  <section>
+    <h2>In one breath</h2>
+    <h3>The whole pipeline</h3>
+    <p>
+      You run <code>publish</code> on a file. It scans for leaks, picks a clean unique slug, uploads
+      the bytes to a single bucket using a key that can't reach anything else, and registers the
+      share with an edge Worker. From then on, that Worker serves your artifact from a short public
+      URL — enforcing the password, the expiry, and the revocation switch on every request, and
+      writing every access to an audit log. Two small pieces, one clean seam, and a credential scoped
+      so tightly that the worst-case leak exposes only the things you already chose to publish.
+    </p>
+  </section>
+
+  <footer>
+    <p class="meta">drop.jonomatus.ky — a self-hosted static-artifact publisher on Cloudflare Workers, R2, and D1.</p>
+    <p>Published with the tool it describes. This is personal infrastructure, not a service for sale.</p>
+    <p>Built by <a href="https://x.com/jonomatusky">jonomatusky</a> · source at
+      <a href="https://github.com/jonomatusky/drop">github.com/jonomatusky/drop</a></p>
+  </footer>
+
+</div>
+</body>
+</html>

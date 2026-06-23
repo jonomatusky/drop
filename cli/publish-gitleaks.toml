@@ -1,0 +1,10 @@
+title = "drop publish gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "drop publish false-positive allowlist. Keep this intentionally small."
+paths = [
+  '''(^|/)\.publish-test\.[^/]+/''',
+]
