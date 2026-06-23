@@ -109,7 +109,7 @@ purely a difference in how the **slug** is shaped (entirely CLI-side).
 |------|------|------|-----------|------------|
 | **Private** *(default)* | *(none)* | password | clean `…/acme-proposal/` | drafts, anything you'll gate — send the password out-of-band |
 | **Unlisted** | `--unlisted` | none | readable + ~82-bit tail `…/acme-proposal-k7f3m9q2x8p4n6tz/` | a link you want frictionless but not enumerable — the URL *is* the key |
-| **Public** | `--public` | none | clean `…/about/` | content meant to be discoverable |
+| **Public** | `--public` | none | clean `…/how-drop-works/` | content meant to be discoverable |
 
 - **Private** is the default. The slug is just a label; the password is the lock,
   verified server-side (PBKDF2) and sent out-of-band — so a guessable name leaks
