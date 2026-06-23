@@ -254,13 +254,13 @@
     <div class="flow">
       <div class="flow-step">
         <span class="k">Local · the CLI</span>
-        <h4><code>publish path/to/artifact</code></h4>
+        <h4><code>drop path/to/artifact</code></h4>
         <p>Runs a no-leak preflight, resolves a readable slug, uploads each file as an object to R2 storage, then calls the Worker's admin API to write the canonical manifest for the share.</p>
       </div>
       <div class="flow-arrow">↓</div>
       <div class="flow-step">
         <span class="k">Object storage · R2</span>
-        <h4>Files land in <code>merit-publish-artifacts</code></h4>
+        <h4>Files land in <code>drop-artifacts</code></h4>
         <p>Cloudflare R2 holds the raw bytes of every published file. The CLI writes them; the Worker reads them. Nothing is served from your machine.</p>
       </div>
       <div class="flow-arrow">↓</div>
@@ -299,7 +299,7 @@
     </div>
     <p class="muted">
       Because the manifest carries an expiry and a revocation timestamp, a share can be switched off
-      (<code>publish revoke &lt;slug&gt;</code>) or made to lapse without touching the stored files —
+      (<code>drop revoke &lt;slug&gt;</code>) or made to lapse without touching the stored files —
       the Worker simply refuses to serve a slug the database says is dead.
     </p>
   </section>
@@ -382,7 +382,7 @@
       <p>
         The most deliberate design choice is about <em>blast radius</em>. The Cloudflare account
         behind this also runs other things — another app's storage, databases, and Workers. So the
-        credential that <code>publish</code> uses for its constant job — uploading files on every run
+        credential that <code>drop</code> uses for its constant job — uploading files on every run
         — is scoped down to exactly one bucket and nothing else.
       </p>
       <p>
@@ -399,7 +399,7 @@ wrangler r2 object put …
 <span class="f">S3 PUT (SigV4)</span> with an <span class="f">Object Read &amp; Write</span> token
   <span class="c">↳ Object R/W tokens ARE bucket-scopeable</span>
   <span class="c">↳ their credential is an S3 Access Key ID + Secret</span>
-  <span class="c">↳ scoped to merit-publish-artifacts only</span></code></pre>
+  <span class="c">↳ scoped to drop-artifacts only</span></code></pre>
       <p>
         In short: the only Cloudflare token type that can be locked to a single bucket is an
         <strong>Object Read &amp; Write</strong> token, and that token speaks <strong>S3</strong>, not
@@ -410,7 +410,7 @@ wrangler r2 object put …
       <div class="twocol">
         <div class="card good">
           <span class="lbl">✓ Can</span>
-          <p>Write objects into <code>merit-publish-artifacts</code> — the one bucket this tool owns.</p>
+          <p>Write objects into <code>drop-artifacts</code> — the one bucket this tool owns.</p>
         </div>
         <div class="card bad">
           <span class="lbl">✗ Cannot</span>
@@ -419,7 +419,7 @@ wrangler r2 object put …
       </div>
 
       <p style="font-size:14.5px;color:var(--ink-dim);padding-bottom:18px;">
-        There's even a self-test for it. <code>publish scope-test</code> uses the upload key to prove
+        There's even a self-test for it. <code>drop scope-test</code> uses the upload key to prove
         it <em>can</em> write the artifacts bucket and is <em>denied</em> (401/403) on a known
         forbidden bucket. If the forbidden bucket is ever readable, the token is mis-scoped and the
         check fails loudly.
@@ -455,7 +455,7 @@ wrangler r2 object put …
     <h2>In one breath</h2>
     <h3>The whole pipeline</h3>
     <p>
-      You run <code>publish</code> on a file. It scans for leaks, picks a clean unique slug, uploads
+      You run <code>drop</code> on a file. It scans for leaks, picks a clean unique slug, uploads
       the bytes to a single bucket using a key that can't reach anything else, and registers the
       share with an edge Worker. From then on, that Worker serves your artifact from a short public
       URL — enforcing the password, the expiry, and the revocation switch on every request, and

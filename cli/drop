@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-publish — static-artifact sharing CLI for a self-hosted `drop` deployment.
+drop — static-artifact publishing CLI for a self-hosted `drop` deployment.
 
 The CLI owns the local no-leak preflight and orchestration. The Worker (see
 ../worker) owns public serving, auth, expiry, revoke, and the canonical D1
@@ -10,23 +10,23 @@ Configuration is via environment variables (a macOS keychain fallback is an
 optional convenience — see README.md):
 
   Required
-    PUBLISH_BASE_URL            base URL of your deployed Worker, e.g.
+    DROP_BASE_URL               base URL of your deployed Worker, e.g.
                                 https://drop.example.com  (no trailing slash needed)
-    PUBLISH_CF_ACCOUNT_ID       your Cloudflare account id (an identifier, not a
+    DROP_CF_ACCOUNT_ID          your Cloudflare account id (an identifier, not a
                                 secret) — used to address R2's S3 endpoint
-    PUBLISH_R2_ACCESS_KEY_ID    S3 Access Key ID of a bucket-scoped R2
+    DROP_R2_ACCESS_KEY_ID       S3 Access Key ID of a bucket-scoped R2
                                 "Object Read & Write" token
-    PUBLISH_R2_SECRET_ACCESS_KEY  the matching S3 secret
-    PUBLISH_ADMIN_TOKEN         bearer token gating the Worker's /admin/* routes
+    DROP_R2_SECRET_ACCESS_KEY   the matching S3 secret
+    DROP_ADMIN_TOKEN            bearer token gating the Worker's /admin/* routes
 
   Optional
-    PUBLISH_R2_BUCKET           artifact bucket name (default: publish-artifacts)
-    PUBLISH_FORBIDDEN_R2_BUCKET a bucket the upload creds must NOT reach; enables
-                                the `publish scope-test` blast-radius check
-    PUBLISH_GITLEAKS_CONFIG     path to a gitleaks config (default: the bundled
-                                publish-gitleaks.toml next to this script)
-    PUBLISH_KEYCHAIN_ACCOUNT    macOS keychain account to read secrets under
-    PUBLISH_*_KEYCHAIN          override the keychain service name for each secret
+    DROP_R2_BUCKET              artifact bucket name (default: drop-artifacts)
+    DROP_FORBIDDEN_R2_BUCKET    a bucket the upload creds must NOT reach; enables
+                                the `drop scope-test` blast-radius check
+    DROP_GITLEAKS_CONFIG        path to a gitleaks config (default: the bundled
+                                drop-gitleaks.toml next to this script)
+    DROP_KEYCHAIN_ACCOUNT       macOS keychain account to read secrets under
+    DROP_*_KEYCHAIN             override the keychain service name for each secret
 """
 
 from __future__ import annotations
@@ -54,22 +54,22 @@ from pathlib import Path
 
 # --- Configuration ---------------------------------------------------------
 
-DEFAULT_BUCKET = "publish-artifacts"
+DEFAULT_BUCKET = "drop-artifacts"
 # A bucket the upload creds must NOT be able to reach (proves bucket-scoping).
-# Optional: set PUBLISH_FORBIDDEN_R2_BUCKET to enable the `scope-test` check.
+# Optional: set DROP_FORBIDDEN_R2_BUCKET to enable the `scope-test` check.
 # Example from my own setup: another app's prod bucket on the same account.
-DEFAULT_FORBIDDEN_R2_BUCKET = os.environ.get("PUBLISH_FORBIDDEN_R2_BUCKET", "")
+DEFAULT_FORBIDDEN_R2_BUCKET = os.environ.get("DROP_FORBIDDEN_R2_BUCKET", "")
 
 # Secret sources. Each reads $ENV first; if unset, falls back to the macOS
 # keychain (service name below, overridable via the matching *_KEYCHAIN env).
-R2_ACCESS_KEY_ENV = "PUBLISH_R2_ACCESS_KEY_ID"
-R2_SECRET_KEY_ENV = "PUBLISH_R2_SECRET_ACCESS_KEY"
-ADMIN_TOKEN_ENV = "PUBLISH_ADMIN_TOKEN"
-R2_ACCESS_KEY_KEYCHAIN = os.environ.get("PUBLISH_R2_ACCESS_KEY_ID_KEYCHAIN", "publish-r2-access-key-id")
-R2_SECRET_KEY_KEYCHAIN = os.environ.get("PUBLISH_R2_SECRET_ACCESS_KEY_KEYCHAIN", "publish-r2-secret-access-key")
-ADMIN_TOKEN_KEYCHAIN = os.environ.get("PUBLISH_ADMIN_TOKEN_KEYCHAIN", "publish-admin-token")
+R2_ACCESS_KEY_ENV = "DROP_R2_ACCESS_KEY_ID"
+R2_SECRET_KEY_ENV = "DROP_R2_SECRET_ACCESS_KEY"
+ADMIN_TOKEN_ENV = "DROP_ADMIN_TOKEN"
+R2_ACCESS_KEY_KEYCHAIN = os.environ.get("DROP_R2_ACCESS_KEY_ID_KEYCHAIN", "drop-r2-access-key-id")
+R2_SECRET_KEY_KEYCHAIN = os.environ.get("DROP_R2_SECRET_ACCESS_KEY_KEYCHAIN", "drop-r2-secret-access-key")
+ADMIN_TOKEN_KEYCHAIN = os.environ.get("DROP_ADMIN_TOKEN_KEYCHAIN", "drop-admin-token")
 
-DEFAULT_GITLEAKS_CONFIG = Path(__file__).resolve().parent / "publish-gitleaks.toml"
+DEFAULT_GITLEAKS_CONFIG = Path(__file__).resolve().parent / "drop-gitleaks.toml"
 
 SECRET_FILE_RE = re.compile(
     r"(^|/)(\.env(\..*)?|\.npmrc|\.pypirc|id_rsa|id_dsa|id_ed25519|.*\.pem|.*\.key|credentials|secrets?)(/|$)",
@@ -100,7 +100,7 @@ class AssetParser(html.parser.HTMLParser):
 
 
 def die(message: str, code: int = 1) -> None:
-    print(f"publish: {message}", file=sys.stderr)
+    print(f"drop: {message}", file=sys.stderr)
     raise SystemExit(code)
 
 
@@ -112,7 +112,7 @@ def _keychain_get(service: str) -> str | None:
     """Optional macOS keychain convenience. Returns the secret or None.
 
     Prefers a `kc-get <service>` helper on PATH if present, else falls back to
-    `security find-generic-password`. Set PUBLISH_KEYCHAIN_ACCOUNT to scope the
+    `security find-generic-password`. Set DROP_KEYCHAIN_ACCOUNT to scope the
     lookup to a specific keychain account.
     """
     helper = shutil.which("kc-get")
@@ -123,7 +123,7 @@ def _keychain_get(service: str) -> str | None:
         return None
     if sys.platform == "darwin" and shutil.which("security"):
         cmd = ["security", "find-generic-password", "-s", service, "-w"]
-        account = os.environ.get("PUBLISH_KEYCHAIN_ACCOUNT")
+        account = os.environ.get("DROP_KEYCHAIN_ACCOUNT")
         if account:
             cmd[1:1] = ["-a", account]
         proc = run(cmd)
@@ -155,7 +155,7 @@ def require_env(name: str, label: str) -> str:
 
 
 def base_url() -> str:
-    return require_env("PUBLISH_BASE_URL", "Worker base URL").rstrip("/")
+    return require_env("DROP_BASE_URL", "Worker base URL").rstrip("/")
 
 
 def utc_now() -> dt.datetime:
@@ -273,8 +273,8 @@ def scan_pii(files: list[tuple[Path, str]]) -> tuple[list[str], list[str]]:
 def run_gitleaks(path: Path) -> list[dict]:
     gitleaks = shutil.which("gitleaks")
     if not gitleaks:
-        raise PublishError("gitleaks is required for publish preflight (install it before publishing)")
-    config_path = Path(os.environ.get("PUBLISH_GITLEAKS_CONFIG", DEFAULT_GITLEAKS_CONFIG)).expanduser()
+        raise PublishError("gitleaks is required for the publish preflight (install it before publishing)")
+    config_path = Path(os.environ.get("DROP_GITLEAKS_CONFIG", DEFAULT_GITLEAKS_CONFIG)).expanduser()
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as report:
         report_path = Path(report.name)
     try:
@@ -412,7 +412,7 @@ def preflight(path: Path, files: list[tuple[Path, str]], args: argparse.Namespac
 def _actor() -> str:
     """A best-effort uploader identity for the audit trail (no hard dependency on
     a populated passwd entry, which can be empty in containers)."""
-    return os.environ.get("PUBLISH_ACTOR") or os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
+    return os.environ.get("DROP_ACTOR") or os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
 
 
 def digest_files(files: list[tuple[Path, str]]) -> tuple[str, int, list[dict]]:
@@ -462,7 +462,7 @@ def admin_request(method: str, path: str, token: str, payload: dict | None = Non
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             # Cloudflare's edge 1010-blocks python-urllib's default UA on some paths.
-            "User-Agent": "publish-cli/1.0",
+            "User-Agent": "drop-cli/1.0",
         },
     )
     try:
@@ -477,7 +477,7 @@ def admin_request(method: str, path: str, token: str, payload: dict | None = Non
 
 
 def _r2_account_id() -> str:
-    return require_env("PUBLISH_CF_ACCOUNT_ID", "Cloudflare account id")
+    return require_env("DROP_CF_ACCOUNT_ID", "Cloudflare account id")
 
 
 def s3_request(
@@ -491,7 +491,7 @@ def s3_request(
     timeout: int = 60,
 ) -> tuple[int, bytes]:
     """Signed (AWS SigV4) request to R2's S3 endpoint with the bucket-scoped
-    publish creds. Returns (status, response_body); HTTP errors are returned, not
+    upload creds. Returns (status, response_body); HTTP errors are returned, not
     raised, so callers can assert on the status (e.g. scope-test wants 403)."""
     access_key = get_secret(R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_KEYCHAIN, "R2 S3 access key id")
     secret = get_secret(R2_SECRET_KEY_ENV, R2_SECRET_KEY_KEYCHAIN, "R2 S3 secret access key")
@@ -548,7 +548,7 @@ def s3_request(
 
 
 def upload_r2(files: list[tuple[Path, str]], slug: str) -> None:
-    bucket = os.environ.get("PUBLISH_R2_BUCKET", DEFAULT_BUCKET)
+    bucket = os.environ.get("DROP_R2_BUCKET", DEFAULT_BUCKET)
     for path, rel in files:
         key = f"{slug}/{rel}"
         content_type = mimetypes.guess_type(rel)[0] or "application/octet-stream"
@@ -661,14 +661,14 @@ def cmd_revoke(args: argparse.Namespace) -> None:
 
 
 def cmd_scope_test(_: argparse.Namespace) -> None:
-    """Prove the publish upload creds are bucket-scoped: they must be able to write
-    our own bucket but be denied (401/403) on a known forbidden bucket. This tests
+    """Prove the upload creds are bucket-scoped: they must be able to write our
+    own bucket but be denied (401/403) on a known forbidden bucket. This tests
     the credentials actually used for uploads, over the same S3 path they use.
 
-    Set PUBLISH_FORBIDDEN_R2_BUCKET to a bucket on the same account that the
-    upload creds must NOT reach (e.g. another app's bucket)."""
-    bucket = os.environ.get("PUBLISH_R2_BUCKET", DEFAULT_BUCKET)
-    forbidden = os.environ.get("PUBLISH_FORBIDDEN_R2_BUCKET", DEFAULT_FORBIDDEN_R2_BUCKET)
+    Set DROP_FORBIDDEN_R2_BUCKET to a bucket on the same account that the upload
+    creds must NOT reach (e.g. another app's bucket)."""
+    bucket = os.environ.get("DROP_R2_BUCKET", DEFAULT_BUCKET)
+    forbidden = os.environ.get("DROP_FORBIDDEN_R2_BUCKET", DEFAULT_FORBIDDEN_R2_BUCKET)
     failures: list[str] = []
 
     # 1) The forbidden bucket must be unreachable (skipped if none configured).
@@ -678,7 +678,7 @@ def cmd_scope_test(_: argparse.Namespace) -> None:
         if status not in (401, 403):
             failures.append(f"S3 read of forbidden bucket '{forbidden}' returned HTTP {status}; expected 401/403")
     else:
-        print("scope-test: no PUBLISH_FORBIDDEN_R2_BUCKET set; skipping the forbidden-bucket check", file=sys.stderr)
+        print("scope-test: no DROP_FORBIDDEN_R2_BUCKET set; skipping the forbidden-bucket check", file=sys.stderr)
 
     # 2) Our own bucket must be writable (proves the creds are valid, not just dead).
     probe_key = "scope-test/probe.txt"
@@ -697,7 +697,7 @@ def cmd_scope_test(_: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="publish")
+    parser = argparse.ArgumentParser(prog="drop")
     parser.add_argument("--client", help="client/recipient label; sets the readable slug (default: the file/dir name)")
     parser.add_argument("--label", help="internal label when --client is not appropriate; also sets the readable slug")
     # Visibility (default = password-protected). --public and --unlisted both drop
@@ -728,7 +728,7 @@ def main(argv: list[str] | None = None) -> int:
             die(str(err))
     if argv and argv[0] == "revoke":
         if len(argv) != 2:
-            die("usage: publish revoke <slug>", code=2)
+            die("usage: drop revoke <slug>", code=2)
         try:
             cmd_revoke(argparse.Namespace(slug=argv[1]))
             return 0

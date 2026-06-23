@@ -1,0 +1,10 @@
+title = "drop gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "drop preflight false-positive allowlist. Keep this intentionally small."
+paths = [
+  '''(^|/)\.drop-test\.[^/]+/''',
+]

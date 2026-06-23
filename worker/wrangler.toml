@@ -15,7 +15,7 @@ routes = [
 
 [[r2_buckets]]
 binding = "ARTIFACTS"
-bucket_name = "publish-artifacts"
+bucket_name = "drop-artifacts"
 
 [[kv_namespaces]]
 binding = "AUTH_KV"

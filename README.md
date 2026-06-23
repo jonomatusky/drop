@@ -6,8 +6,11 @@ a password gate, expiry, revocation, a no-index policy, and an audit trail
 behind it.
 
 ```
-publish path/to/report.html   →   https://drop.example.com/report/
+drop path/to/report.html   →   https://drop.example.com/report/
 ```
+
+It's the outbound counterpart to a capture inbox: where a tool like `bin` takes
+things *in*, `drop` puts a finished artifact *out*.
 
 This is **personal, self-hostable, open-source infrastructure** — a tool you
 deploy to *your own* Cloudflare account. It is **not** a hosted product and there
@@ -28,7 +31,7 @@ pages, checking passwords, honoring expiry. Neither half holds more power than
 its job requires.
 
 ```
-   you ──▶  publish path/to/artifact            (local · the CLI)
+   you ──▶  drop path/to/artifact               (local · the CLI)
               │  no-leak preflight
               │  resolve a readable slug
               │  upload each file to R2 over S3
@@ -38,7 +41,7 @@ its job requires.
             D1 database ◀ manifest+audit ┘     GET /<slug>/…
 ```
 
-- **`cli/publish`** — a zero-dependency Python 3 script (stdlib only). It runs the
+- **`cli/drop`** — a zero-dependency Python 3 script (stdlib only). It runs the
   preflight, picks a unique readable slug, uploads each file as an object to R2
   over the S3 API, then calls the Worker's `/admin/*` API to write the canonical
   manifest row.
@@ -65,12 +68,12 @@ Storage and bookkeeping are kept separate.
   - **`shares`** — one row per share: slug, label, auth mode, content hash, the
     JSON file list, byte count, the preflight scan result, and created / expiry /
     revoked timestamps plus who uploaded it.
-  - **`audit_events`** — an append-only history keyed by slug: every `publish`
-    and `revoke` is recorded with actor, timestamp, and details. The manifest is
+  - **`audit_events`** — an append-only history keyed by slug: every publish and
+    every revoke is recorded with actor, timestamp, and details. The manifest is
     mutable (a republish upserts the row); the audit log only ever grows.
 
 Because the row carries an expiry and a revocation timestamp, a share can be
-switched off (`publish revoke <slug>`) or made to lapse **without touching the
+switched off (`drop revoke <slug>`) or made to lapse **without touching the
 stored files** — the Worker simply refuses to serve a slug the database says is
 dead. Revoke additionally deletes the R2 objects and (optionally) purges the edge
 cache.
@@ -122,8 +125,7 @@ purely a difference in how the **slug** is shaped (entirely CLI-side).
 - **Public** is no-password with a clean, guessable slug, for content meant to be
   found. To the Worker it's identical to unlisted (`auth_mode="public"`).
 
-Pair any tier with `--expire 7d` and `publish revoke <slug>` for time-boxed
-shares.
+Pair any tier with `--expire 7d` and `drop revoke <slug>` for time-boxed shares.
 
 ---
 
@@ -131,7 +133,7 @@ shares.
 
 The most deliberate design choice is about **blast radius**. The Cloudflare
 account behind a deployment usually runs other things too — other apps' storage,
-databases, Workers. So the credential `publish` uses for its constant job —
+databases, Workers. So the credential `drop` uses for its constant job —
 uploading files on every run — is scoped down to *exactly one bucket and nothing
 else*.
 
@@ -166,11 +168,11 @@ credential that simply *cannot* reach anything it shouldn't.
 There's even a self-test for it:
 
 ```bash
-publish scope-test
+drop scope-test
 ```
 
 It uses the upload key to prove it *can* write the artifacts bucket and is
-*denied* (401/403) on a known forbidden bucket (set `PUBLISH_FORBIDDEN_R2_BUCKET`
+*denied* (401/403) on a known forbidden bucket (set `DROP_FORBIDDEN_R2_BUCKET`
 to a bucket on the same account the upload creds must not reach). If the forbidden
 bucket is ever readable, the token is mis-scoped and the check fails loudly.
 
@@ -188,7 +190,7 @@ delete. So every run is gated by a local scan **before a single byte is
 uploaded**:
 
 - **Secret scan.** A [`gitleaks`](https://github.com/gitleaks/gitleaks) content
-  pass (with a small [bundled config](cli/publish-gitleaks.toml)) blocks anything
+  pass (with a small [bundled config](cli/drop-gitleaks.toml)) blocks anything
   that looks like a key or token. **gitleaks is required** — the preflight refuses
   to run without it.
 - **Dangerous filenames.** `.env`, private keys (`*.pem`, `id_rsa`, …), and
@@ -218,8 +220,8 @@ always validates on the other. The Worker compares in constant time.
 ```
 drop/
 ├── cli/
-│   ├── publish                  # the CLI (zero-dependency Python 3)
-│   └── publish-gitleaks.toml    # bundled gitleaks config for the preflight
+│   ├── drop                     # the CLI (zero-dependency Python 3)
+│   └── drop-gitleaks.toml       # bundled gitleaks config for the preflight
 ├── worker/
 │   ├── src/worker.mjs           # the edge Worker
 │   ├── schema.sql               # D1 schema: shares + audit_events
@@ -243,34 +245,33 @@ The CLI is configured entirely through environment variables. On macOS, an
 
 | Variable | Required | Meaning |
 |----------|----------|---------|
-| `PUBLISH_BASE_URL` | ✅ | base URL of your deployed Worker, e.g. `https://drop.example.com` |
-| `PUBLISH_CF_ACCOUNT_ID` | ✅ | your Cloudflare account id (an identifier, not a secret) — used to address R2's S3 endpoint |
-| `PUBLISH_R2_ACCESS_KEY_ID` | ✅ | S3 Access Key ID of the bucket-scoped R2 *Object Read & Write* token |
-| `PUBLISH_R2_SECRET_ACCESS_KEY` | ✅ | the matching S3 secret |
-| `PUBLISH_ADMIN_TOKEN` | ✅ | bearer token gating the Worker's `/admin/*` routes |
-| `PUBLISH_R2_BUCKET` | — | artifacts bucket name (default `publish-artifacts`) |
-| `PUBLISH_FORBIDDEN_R2_BUCKET` | — | a bucket the upload creds must *not* reach; enables `scope-test`'s deny check |
-| `PUBLISH_GITLEAKS_CONFIG` | — | path to a gitleaks config (default: the bundled one) |
+| `DROP_BASE_URL` | ✅ | base URL of your deployed Worker, e.g. `https://drop.example.com` |
+| `DROP_CF_ACCOUNT_ID` | ✅ | your Cloudflare account id (an identifier, not a secret) — used to address R2's S3 endpoint |
+| `DROP_R2_ACCESS_KEY_ID` | ✅ | S3 Access Key ID of the bucket-scoped R2 *Object Read & Write* token |
+| `DROP_R2_SECRET_ACCESS_KEY` | ✅ | the matching S3 secret |
+| `DROP_ADMIN_TOKEN` | ✅ | bearer token gating the Worker's `/admin/*` routes |
+| `DROP_R2_BUCKET` | — | artifacts bucket name (default `drop-artifacts`) |
+| `DROP_FORBIDDEN_R2_BUCKET` | — | a bucket the upload creds must *not* reach; enables `scope-test`'s deny check |
+| `DROP_GITLEAKS_CONFIG` | — | path to a gitleaks config (default: the bundled one) |
 
 Each of the three secrets reads its `$ENV` var first; if unset, it falls back to
-the macOS keychain (service names `publish-r2-access-key-id`,
-`publish-r2-secret-access-key`, `publish-admin-token`, overridable via the
-matching `PUBLISH_*_KEYCHAIN` vars; scope to a keychain account with
-`PUBLISH_KEYCHAIN_ACCOUNT`). Env vars are the portable path; the keychain is just
-a local convenience.
+the macOS keychain (service names `drop-r2-access-key-id`,
+`drop-r2-secret-access-key`, `drop-admin-token`, overridable via the matching
+`DROP_*_KEYCHAIN` vars; scope to a keychain account with `DROP_KEYCHAIN_ACCOUNT`).
+Env vars are the portable path; the keychain is just a local convenience.
 
 Requirements: Python 3.10+ and `gitleaks` on `PATH` (plus `tesseract` if you
-publish images). Symlink `cli/publish` somewhere on your `PATH`.
+publish images). Symlink `cli/drop` somewhere on your `PATH`.
 
 ### 2. Provision Cloudflare (one-time, broad admin token)
 
 1. **R2 upload token** — Cloudflare dash → R2 → *Manage API Tokens* → **Object
    Read & Write**, **Apply to specific buckets only → your artifacts bucket**.
-   Store the S3 Access Key ID + Secret as `PUBLISH_R2_ACCESS_KEY_ID` /
-   `PUBLISH_R2_SECRET_ACCESS_KEY`.
+   Store the S3 Access Key ID + Secret as `DROP_R2_ACCESS_KEY_ID` /
+   `DROP_R2_SECRET_ACCESS_KEY`.
 2. **Admin token** — generate a random bearer; set it as the Worker secret
    `ADMIN_TOKEN` (`wrangler secret put ADMIN_TOKEN`) *and* expose it to the CLI as
-   `PUBLISH_ADMIN_TOKEN`. It gates `/admin/*` (manifest write, list, revoke).
+   `DROP_ADMIN_TOKEN`. It gates `/admin/*` (manifest write, list, revoke).
 3. Create the R2 bucket, the KV namespace, and the D1 database with a broad
    account token; apply `worker/schema.sql` to D1
    (`wrangler d1 execute <db> --file worker/schema.sql`); fill the real KV `id`
@@ -285,7 +286,7 @@ publish images). Symlink `cli/publish` somewhere on your `PATH`.
 6. **(Optional) cache purge on revoke** — set Worker secrets `CF_API_TOKEN` and
    `CF_ZONE_ID` to purge the edge cache when a share is revoked. Cache headers are
    conservative (`no-store`) even without them.
-7. **Verify the blast radius:** `publish scope-test`.
+7. **Verify the blast radius:** `drop scope-test`.
 
 ### 3. Run the Worker tests
 
@@ -298,18 +299,18 @@ cd worker && npm test    # or: node test/worker.test.mjs
 ## Usage
 
 ```bash
-publish path/to/artifact                          # private (password-protected) — the default
-publish --client "Acme" path/to/report            # password, readable slug "acme-…"
-publish --unlisted --client "Acme" path/to/report # secret link: no password, unguessable URL
-publish --public path/to/site                      # truly public: no password, guessable URL
-publish --password "$pw" --expire 7d path/to/site  # explicit password + 7-day expiry
-publish --dry-run path/to/site                     # run preflight + print the manifest, upload nothing
-publish list                                       # list every share
-publish revoke <slug>                              # kill a share (deny + delete objects + purge)
-publish scope-test                                 # blast-radius self-check
+drop path/to/artifact                          # private (password-protected) — the default
+drop --client "Acme" path/to/report            # password, readable slug "acme-…"
+drop --unlisted --client "Acme" path/to/report # secret link: no password, unguessable URL
+drop --public path/to/site                     # truly public: no password, guessable URL
+drop --password "$pw" --expire 7d path/to/site # explicit password + 7-day expiry
+drop --dry-run path/to/site                    # run preflight + print the manifest, upload nothing
+drop list                                      # list every share
+drop revoke <slug>                             # kill a share (deny + delete objects + purge)
+drop scope-test                                # blast-radius self-check
 ```
 
-A successful private publish prints the URL and a generated password; share the
+A successful private share prints the URL and a generated password; send the
 password out-of-band.
 
 ---
