@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Offline unit tests for the `drop` CLI.
+"""Offline unit tests for the `drop` CLI's list/views commands.
 
 Loads the `drop` script (no .py extension) via SourceFileLoader and stubs the
-admin API + secret lookup, so these run with no network and no creds. Run with:
+admin API + secret lookup, so these run with no network and no creds.
 
-    python3 cli/test_drop.py        # or: cd cli && python3 test_drop.py
+Run: python3 cli/test/drop.test.py   (no third-party deps)
 """
 
 import argparse
@@ -14,7 +14,9 @@ import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-DROP = Path(__file__).resolve().parent / "drop"
+# The CLI is a single executable file named `drop` (no .py extension), so load it
+# by path. parents[1] is cli/ (this file lives in cli/test/).
+DROP = Path(__file__).resolve().parents[1] / "drop"
 drop = SourceFileLoader("drop", str(DROP)).load_module()
 
 # No keychain / env needed: every secret lookup yields a dummy token.

@@ -130,6 +130,34 @@ Pair any tier with `--expire 7d` and `drop revoke <slug>` for time-boxed shares.
 
 ---
 
+## Link previews: a generated social card
+
+A URL with no OpenGraph image makes messaging apps (iMessage, Slack, WhatsApp, …)
+fall back to *screenshotting* the page — and a tall page renders as a skinny
+vertical sliver in the chat bubble. So for any share that contains an HTML page,
+`drop` builds a proper **1200×630 landscape card** at publish time, uploads it
+alongside the artifact as `…/<slug>/og.png`, and injects `og:`/`twitter:` meta
+tags into the published HTML. Shared links then render a clean landscape card —
+the page title on a background — instead of a screenshot.
+
+The card title defaults to the page's `<title>`; everything is customizable from
+the CLI:
+
+```bash
+drop --public path/to/site                       # card auto-generated from <title>
+drop --public --card-title "Q3 Board Deck" ...   # override the card title
+drop --public --card-bg "#0b0d12" --card-accent "#5ce0c0" ...   # custom colors
+drop --public --no-card ...                       # opt out entirely
+```
+
+The renderer is **pure Python stdlib** — a small `zlib`/`struct` PNG encoder and
+an embedded public-domain 8×8 bitmap font — so it adds no third-party dependency
+and the card is byte-for-byte deterministic. (A single HTML file is staged as
+`index.html` so the bare `…/<slug>/` URL serves it once the card makes the share
+multi-file.)
+
+---
+
 ## The load-bearing detail: a bucket-scoped R2 token, over S3
 
 The most deliberate design choice is about **blast radius**. The Cloudflare
@@ -223,7 +251,9 @@ drop/
 ├── cli/
 │   ├── drop                     # the CLI (zero-dependency Python 3)
 │   ├── drop-gitleaks.toml       # bundled gitleaks config for the preflight
-│   └── test_drop.py             # offline CLI unit tests (stdlib only)
+│   └── test/                    # CLI unit tests (`python3` — stdlib only)
+│       ├── card.test.py         #   link-preview card
+│       └── drop.test.py         #   list/views output
 ├── worker/
 │   ├── src/worker.mjs           # the edge Worker
 │   ├── schema.sql               # D1 schema: shares + audit_events
@@ -293,8 +323,9 @@ publish images). Symlink `cli/drop` somewhere on your `PATH`.
 ### 3. Run the tests
 
 ```bash
-cd worker && npm test         # Worker unit tests — or: node test/worker.test.mjs
-python3 cli/test_drop.py      # CLI unit tests (offline, no creds)
+cd worker && npm test            # Worker — or: node test/worker.test.mjs
+python3 cli/test/card.test.py    # CLI link-preview card (stdlib only)
+python3 cli/test/drop.test.py    # CLI list/views output (offline, no creds)
 ```
 
 ---
@@ -307,6 +338,8 @@ drop --client "Acme" path/to/report            # password, readable slug "acme-�
 drop --unlisted --client "Acme" path/to/report # secret link: no password, unguessable URL
 drop --public path/to/site                     # truly public: no password, guessable URL
 drop --password "$pw" --expire 7d path/to/site # explicit password + 7-day expiry
+drop --public --card-title "Q3 Deck" path/site # override the generated link-preview card title
+drop --public --no-card path/to/site           # skip the link-preview card + meta tags
 drop --dry-run path/to/site                    # run preflight + print the manifest, upload nothing
 drop list                                      # list every share (with a views=N column)
 drop views <slug>                              # who opened it: count + recent timestamps / IPs / UAs

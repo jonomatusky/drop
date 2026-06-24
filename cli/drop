@@ -44,12 +44,14 @@ import re
 import secrets
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from pathlib import Path
 
 
@@ -558,6 +560,320 @@ def upload_r2(files: list[tuple[Path, str]], slug: str) -> None:
             raise PublishError(f"R2 upload failed for {rel}: HTTP {status}: {response.decode(errors='ignore')[:200]}")
 
 
+# --- Social / link-preview card --------------------------------------------
+#
+# A shared URL with no OpenGraph image makes messaging apps (iMessage, Slack,
+# WhatsApp, …) fall back to screenshotting the page — and a tall page renders as
+# a skinny vertical sliver. To fix that we generate a proper 1200x630 landscape
+# card (the page title on a background) at publish time, upload it as
+# `<slug>/og.png`, and inject og:/twitter: meta tags into the published HTML so
+# previews render the card instead of a screenshot.
+#
+# The renderer is pure stdlib (zlib + struct PNG encoder + an embedded
+# public-domain 8x8 bitmap font) so the CLI keeps its no-third-party-deps
+# promise and the card is byte-for-byte deterministic. The terminal/bitmap
+# aesthetic matches the tool's own look.
+
+# font8x8 by Daniel Hepper <daniel@hepper.net> — Public Domain. Printable ASCII
+# only (0x20..0x7E), 8 bytes per glyph (one byte per row, bit 0 = leftmost px).
+_OG_FONT_FIRST = 0x20
+_OG_FONT_HEX = (
+    "0000000000000000183c3c1818001800363600000000000036367f367f3636000c3e031e301f0c00"
+    "006333180c6663001c361c6e3b336e000606030000000000180c0606060c1800060c1818180c0600"
+    "00663cff3c660000000c0c3f0c0c000000000000000c0c060000003f0000000000000000000c0c00"
+    "6030180c060301003e63737b6f673e000c0e0c0c0c0c3f001e33301c06333f001e33301c30331e00"
+    "383c36337f3078003f031f3030331e001c06031f33331e003f3330180c0c0c001e33331e33331e00"
+    "1e33333e30180e00000c0c00000c0c00000c0c00000c0c06180c0603060c180000003f00003f0000"
+    "060c1830180c06001e3330180c000c003e637b7b7b031e000c1e33333f3333003f66663e66663f00"
+    "3c66030303663c001f36666666361f007f46161e16467f007f46161e16060f003c66030373667c00"
+    "3333333f333333001e0c0c0c0c0c1e007830303033331e006766361e366667000f06060646667f00"
+    "63777f7f6b63630063676f7b736363001c36636363361c003f66663e06060f001e3333333b1e3800"
+    "3f66663e366667001e33070e38331e003f2d0c0c0c0c1e003333333333333f0033333333331e0c00"
+    "6363636b7f7763006363361c1c3663003333331e0c0c1e007f6331184c667f001e06060606061e00"
+    "03060c18306040001e18181818181e00081c36630000000000000000000000ff0c0c180000000000"
+    "00001e303e336e000706063e66663b0000001e3303331e003830303e33336e0000001e333f031e00"
+    "1c36060f06060f0000006e33333e301f0706366e666667000c000e0c0c0c1e00300030303033331e"
+    "070666361e3667000e0c0c0c0c0c1e000000337f7f6b630000001f333333330000001e3333331e00"
+    "00003b66663e060f00006e33333e307800003b6e66060f0000003e031e301f00080c3e0c0c2c1800"
+    "0000333333336e0000003333331e0c000000636b7f7f3600000063361c36630000003333333e301f"
+    "00003f190c263f00380c0c070c0c38001818180018181800070c0c380c0c07006e3b000000000000"
+)
+_OG_FONT = [bytes.fromhex(_OG_FONT_HEX[i * 16 : i * 16 + 16]) for i in range(len(_OG_FONT_HEX) // 16)]
+
+
+def _og_glyph(ch: str) -> bytes:
+    idx = ord(ch) - _OG_FONT_FIRST
+    if 0 <= idx < len(_OG_FONT):
+        return _OG_FONT[idx]
+    return _OG_FONT[ord("?") - _OG_FONT_FIRST]
+
+
+def _parse_hex_color(value: str | None, default: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
+    if not value:
+        return default
+    raw = value.strip().lstrip("#")
+    if len(raw) == 3:
+        raw = "".join(c * 2 for c in raw)
+    if len(raw) != 6:
+        raise PublishError(f"invalid color {value!r}: use a hex color like #0b0d12")
+    try:
+        return (int(raw[0:2], 16), int(raw[2:4], 16), int(raw[4:6], 16))
+    except ValueError:
+        raise PublishError(f"invalid color {value!r}: use a hex color like #0b0d12")
+
+
+def _mix(a: tuple[int, int, int], b: tuple[int, int, int], t: float) -> tuple[int, int, int]:
+    return tuple(max(0, min(255, round(a[i] + (b[i] - a[i]) * t))) for i in range(3))  # type: ignore[return-value]
+
+
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+
+def _png_encode(width: int, height: int, rgb: bytearray) -> bytes:
+    stride = width * 3
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)  # filter type 0 (none)
+        raw += rgb[y * stride : (y + 1) * stride]
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # 8-bit truecolor RGB
+    return sig + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + _png_chunk(b"IEND", b"")
+
+
+def _blit_text(buf: bytearray, width: int, height: int, x: int, y: int, text: str, scale: int, color: tuple[int, int, int]) -> None:
+    cr, cg, cb = color
+    for ch in text:
+        glyph = _og_glyph(ch)
+        for ry in range(8):
+            bits = glyph[ry]
+            if not bits:
+                continue
+            for rx in range(8):
+                if not (bits >> rx) & 1:
+                    continue
+                px0, py0 = x + rx * scale, y + ry * scale
+                for sy in range(scale):
+                    yy = py0 + sy
+                    if yy < 0 or yy >= height:
+                        continue
+                    base_idx = (yy * width + px0) * 3
+                    for sx in range(scale):
+                        xx = px0 + sx
+                        if xx < 0 or xx >= width:
+                            continue
+                        idx = base_idx + sx * 3
+                        buf[idx] = cr
+                        buf[idx + 1] = cg
+                        buf[idx + 2] = cb
+        x += 8 * scale
+
+
+def _wrap_text(text: str, max_chars: int) -> list[str]:
+    max_chars = max(1, max_chars)
+    lines: list[str] = []
+    current = ""
+    for word in text.split():
+        while len(word) > max_chars:  # a single word longer than a line: hard-split
+            if current:
+                lines.append(current)
+                current = ""
+            lines.append(word[:max_chars])
+            word = word[max_chars:]
+        if not current:
+            current = word
+        elif len(current) + 1 + len(word) <= max_chars:
+            current += " " + word
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def render_og_card(
+    title: str,
+    footer: str,
+    *,
+    bg: tuple[int, int, int],
+    fg: tuple[int, int, int],
+    accent: tuple[int, int, int],
+    width: int = 1200,
+    height: int = 630,
+) -> bytes:
+    """Render a 1200x630 link-preview card: the title, wrapped and centered, on a
+    subtle vertical gradient, with an accent top bar and a mono footer line."""
+    buf = bytearray(width * height * 3)
+    # Vertical gradient background (base -> a touch lighter, tinted toward accent).
+    bottom = _mix(_mix(bg, accent, 0.10), (255, 255, 255), 0.04)
+    for y in range(height):
+        t = y / (height - 1)
+        row = bytes(_mix(bg, bottom, t)) * width
+        buf[y * width * 3 : (y + 1) * width * 3] = row
+    # Accent bar across the top.
+    bar = bytes(accent) * width
+    for y in range(10):
+        buf[y * width * 3 : (y + 1) * width * 3] = bar
+
+    margin = 80
+    usable = width - 2 * margin
+    title = title.strip() or footer
+    # Pick the largest scale at which the title fits in a sensible number of lines
+    # and leaves room for the footer.
+    chosen_scale, chosen_lines, line_h = 5, _wrap_text(title, usable // (8 * 5)), 8 * 5 + 10
+    for scale in range(11, 4, -1):
+        lines = _wrap_text(title, usable // (8 * scale))
+        lh = 8 * scale + scale * 2
+        max_lines = 4 if scale > 6 else 5
+        if len(lines) <= max_lines and len(lines) * lh <= height - 230:
+            chosen_scale, chosen_lines, line_h = scale, lines, lh
+            break
+    else:
+        chosen_lines = chosen_lines[:5]
+
+    block_h = len(chosen_lines) * line_h
+    y0 = (height - block_h) // 2 - 16
+    for i, line in enumerate(chosen_lines):
+        _blit_text(buf, width, height, margin, y0 + i * line_h, line, chosen_scale, fg)
+
+    # Footer (host/slug) in the accent color, mono, bottom-left.
+    fscale = 3
+    footer = footer[: max(1, usable // (8 * fscale))]
+    _blit_text(buf, width, height, margin, height - 74, footer, fscale, _mix(accent, bg, 0.15))
+    return _png_encode(width, height, buf)
+
+
+_OG_BLOCK_START = "<!-- drop:og -->"
+_OG_BLOCK_END = "<!-- /drop:og -->"
+
+
+def _esc_attr(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def extract_title(markup: str) -> str | None:
+    match = re.search(r"<title[^>]*>(.*?)</title>", markup, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    text = html.unescape(re.sub(r"\s+", " ", match.group(1)).strip())
+    return text or None
+
+
+def extract_description(markup: str) -> str | None:
+    match = re.search(r"<meta\b[^>]*\bname=[\"']description[\"'][^>]*>", markup, re.IGNORECASE)
+    if not match:
+        return None
+    content = re.search(r"content=[\"'](.*?)[\"']", match.group(0), re.IGNORECASE | re.DOTALL)
+    if not content:
+        return None
+    return html.unescape(re.sub(r"\s+", " ", content.group(1)).strip()) or None
+
+
+def inject_og_meta(markup: str, *, title: str, description: str | None, image_url: str, page_url: str) -> str:
+    """Insert (or replace) an og:/twitter: meta block in the document head. The
+    block is delimited by comment markers so republishing replaces it cleanly
+    rather than stacking duplicates."""
+    tags = [
+        '<meta property="og:type" content="website">',
+        f'<meta property="og:title" content="{_esc_attr(title)}">',
+        f'<meta property="og:url" content="{_esc_attr(page_url)}">',
+        f'<meta property="og:image" content="{_esc_attr(image_url)}">',
+        '<meta property="og:image:width" content="1200">',
+        '<meta property="og:image:height" content="630">',
+        '<meta name="twitter:card" content="summary_large_image">',
+        f'<meta name="twitter:title" content="{_esc_attr(title)}">',
+        f'<meta name="twitter:image" content="{_esc_attr(image_url)}">',
+    ]
+    if description:
+        desc = _esc_attr(description[:300])
+        tags.insert(2, f'<meta property="og:description" content="{desc}">')
+        tags.append(f'<meta name="twitter:description" content="{desc}">')
+    block = _OG_BLOCK_START + "\n" + "\n".join(tags) + "\n" + _OG_BLOCK_END + "\n"
+
+    # Drop any block we wrote before, so republish is idempotent.
+    markup = re.sub(re.escape(_OG_BLOCK_START) + r".*?" + re.escape(_OG_BLOCK_END) + r"\n?", "", markup, flags=re.DOTALL)
+    close = re.search(r"</head\s*>", markup, re.IGNORECASE)
+    if close:
+        return markup[: close.start()] + block + markup[close.start() :]
+    open_head = re.search(r"<head\b[^>]*>", markup, re.IGNORECASE)
+    if open_head:
+        return markup[: open_head.end()] + "\n" + block + markup[open_head.end() :]
+    return block + markup
+
+
+def _prettify_slug(slug: str) -> str:
+    """A human title for a slug, dropping any unguessable random tail."""
+    base = re.sub(r"-[a-z0-9]{12,}$", "", slug)
+    return base.replace("-", " ").strip().title() or slug
+
+
+def _html_files(files: list[tuple[Path, str]]) -> list[str]:
+    return [rel for _, rel in files if rel.lower().endswith((".html", ".htm"))]
+
+
+def _entry_html(files: list[tuple[Path, str]]) -> str | None:
+    htmls = _html_files(files)
+    if not htmls:
+        return None
+    for rel in htmls:
+        if rel.lower() == "index.html":
+            return rel
+    return sorted(htmls)[0]
+
+
+def build_card_assets(
+    files: list[tuple[Path, str]], slug: str, base: str, args: argparse.Namespace
+) -> tuple[list[tuple[Path, str]], tempfile.TemporaryDirectory, dict]:
+    """Stage a copy of the publish set with an OG card image added and og:/twitter:
+    meta injected into every HTML file. Returns the staged (path, rel) list, the
+    temp dir owning those files (caller must clean up), and a small note dict."""
+    entry = _entry_html(files)
+    entry_path = next(path for path, rel in files if rel == entry)
+    markup = entry_path.read_text(encoding="utf-8", errors="ignore")
+
+    title = args.card_title or extract_title(markup) or args.client or args.label or _prettify_slug(slug)
+    description = extract_description(markup)
+    image_url = f"{base}/{slug}/og.png"
+    page_url = f"{base}/{slug}/"
+    host = urllib.parse.urlsplit(base).netloc or base
+    bg = _parse_hex_color(args.card_bg, (11, 13, 18))
+    fg = _parse_hex_color(args.card_fg, (232, 235, 242))
+    accent = _parse_hex_color(args.card_accent, (122, 162, 255))
+    png = render_og_card(title, f"{host}/{slug}", bg=bg, fg=fg, accent=accent)
+
+    # A single HTML file is the share's entry page: stage it as index.html so the
+    # bare `/<slug>/` URL serves it (the Worker's single-file root fallback no
+    # longer applies once og.png makes the share multi-file).
+    single_html = len(files) == 1 and entry is not None
+    tmp = tempfile.TemporaryDirectory(prefix="drop-card-")
+    root = Path(tmp.name)
+    staged: list[tuple[Path, str]] = []
+    for path, rel in files:
+        out_rel = "index.html" if (single_html and rel == entry and rel.lower() != "index.html") else rel
+        dest = root / out_rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if rel.lower().endswith((".html", ".htm")):
+            page = path.read_text(encoding="utf-8", errors="ignore")
+            dest.write_text(
+                inject_og_meta(page, title=title, description=description, image_url=image_url, page_url=page_url),
+                encoding="utf-8",
+            )
+        else:
+            shutil.copyfile(path, dest)
+        staged.append((dest, out_rel))
+    og_dest = root / "og.png"
+    og_dest.write_bytes(png)
+    staged.append((og_dest, "og.png"))
+    note = {"title": title, "image": image_url, "entry": entry}
+    return staged, tmp, note
+
+
 def resolve_unique_slug(base: str, admin_token: str) -> str:
     """Pick a free, readable slug: the base name if available, else base-2,
     base-3, … Every existing share counts as taken — including expired and
@@ -581,6 +897,9 @@ def cmd_publish(args: argparse.Namespace) -> None:
         raise PublishError("--password has no effect on --public/--unlisted shares (those tiers have no password); drop one")
     if args.unlisted and args.slug:
         raise PublishError("--slug defeats --unlisted's unguessable tail, leaving an open guessable URL; use one or the other")
+    # Validate card colors up front so a typo fails before any slow work.
+    for value in (args.card_bg, args.card_fg, args.card_accent):
+        _parse_hex_color(value, None)
 
     path = Path(args.path).expanduser().resolve()
     files = iter_files(path)
@@ -601,39 +920,58 @@ def cmd_publish(args: argparse.Namespace) -> None:
     base_name = path.stem if path.is_file() else path.name
     slug = args.slug or generated_slug(args.client or args.label or base_name, secret=args.unlisted)
     password = None if no_password else (args.password or secrets.token_urlsafe(18))
-    artifact_sha, total_bytes, file_rows = digest_files(files)
     created_at = utc_now().isoformat()
-    manifest = {
-        "slug": slug,
-        "label": args.client or args.label,
-        "auth_mode": auth_mode,
-        "sha256": artifact_sha,
-        "files": file_rows,
-        "bytes": total_bytes,
-        "scan_result": scan_result,
-        "created_at": created_at,
-        "expires_at": args.expire.isoformat() if args.expire else None,
-        "uploader": f"{_actor()}@{socket.gethostname()}",
-        "override_log": scan_result["override_log"],
-    }
-    if password:
-        manifest["password_verifier"] = password_verifier(password)
-
     base = base_url()
-    if args.dry_run:
-        print(json.dumps({"dry_run": True, "url": f"{base}/{slug}/", "manifest": manifest}, indent=2))
-        return
 
-    admin_token = get_secret(ADMIN_TOKEN_ENV, ADMIN_TOKEN_KEYCHAIN, "Worker admin token")
-    # Auto-generated readable slugs get a unique name on clash (ted-page-2, …);
+    # Resolve the final slug BEFORE building the card: the og:image URL and og:url
+    # embed it. Auto-generated slugs get a unique name on clash (ted-page-2, …);
     # an explicit --slug is honored as-is so a known share republishes in place.
-    if not args.slug:
-        slug = resolve_unique_slug(slug, admin_token)
-        manifest["slug"] = slug
-    upload_r2(files, slug)
-    admin_request("POST", "/admin/manifest", admin_token, manifest)
+    admin_token = None
+    if not args.dry_run:
+        admin_token = get_secret(ADMIN_TOKEN_ENV, ADMIN_TOKEN_KEYCHAIN, "Worker admin token")
+        if not args.slug:
+            slug = resolve_unique_slug(slug, admin_token)
+
+    # Generate a link-preview card and inject og:/twitter: meta into the HTML, so
+    # shared links render a proper landscape card instead of a tall screenshot.
+    # Only meaningful when the share actually has an HTML page to preview.
+    published = files
+    card_tmp: tempfile.TemporaryDirectory | None = None
+    card_note: dict | None = None
+    try:
+        if not args.no_card and _html_files(files):
+            published, card_tmp, card_note = build_card_assets(files, slug, base, args)
+
+        artifact_sha, total_bytes, file_rows = digest_files(published)
+        manifest = {
+            "slug": slug,
+            "label": args.client or args.label,
+            "auth_mode": auth_mode,
+            "sha256": artifact_sha,
+            "files": file_rows,
+            "bytes": total_bytes,
+            "scan_result": scan_result,
+            "created_at": created_at,
+            "expires_at": args.expire.isoformat() if args.expire else None,
+            "uploader": f"{_actor()}@{socket.gethostname()}",
+            "override_log": scan_result["override_log"],
+        }
+        if password:
+            manifest["password_verifier"] = password_verifier(password)
+
+        if args.dry_run:
+            print(json.dumps({"dry_run": True, "url": f"{base}/{slug}/", "card": card_note, "manifest": manifest}, indent=2))
+            return
+
+        upload_r2(published, slug)
+        admin_request("POST", "/admin/manifest", admin_token, manifest)
+    finally:
+        if card_tmp is not None:
+            card_tmp.cleanup()
 
     print(f"url: {base}/{slug}/")
+    if card_note:
+        print(f"card: {card_note['image']}")
     if password:
         print(f"password: {password}")
     if scan_result["warnings"]:
@@ -727,6 +1065,13 @@ def build_parser() -> argparse.ArgumentParser:
     visibility.add_argument("--unlisted", action="store_true", help="secret link: no password, unguessable URL — share the link directly")
     parser.add_argument("--password", help="set an explicit password instead of generating one (password tier only)")
     parser.add_argument("--expire", type=parse_duration, help="server-side expiry duration, e.g. 7d")
+    # Link-preview (OpenGraph/Twitter) card. Generated for HTML shares so a shared
+    # URL renders a landscape card instead of a tall page screenshot.
+    parser.add_argument("--card-title", metavar="TEXT", help="title shown on the link-preview card (default: the page <title>)")
+    parser.add_argument("--card-bg", metavar="HEX", help="card background color, e.g. #0b0d12")
+    parser.add_argument("--card-fg", metavar="HEX", help="card title color, e.g. #e8ebf2")
+    parser.add_argument("--card-accent", metavar="HEX", help="card accent color, e.g. #7aa2ff")
+    parser.add_argument("--no-card", action="store_true", help="do not generate a link-preview card or inject preview meta tags")
     parser.add_argument("--slug", help=argparse.SUPPRESS)
     parser.add_argument("--allow-secret", metavar="REASON", help="override gitleaks findings; reason is logged")
     parser.add_argument("--allow-pii", metavar="REASON", help="override high-confidence PII findings; reason is logged")
