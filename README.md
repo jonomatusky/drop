@@ -68,9 +68,10 @@ Storage and bookkeeping are kept separate.
   - **`shares`** — one row per share: slug, label, auth mode, content hash, the
     JSON file list, byte count, the preflight scan result, and created / expiry /
     revoked timestamps plus who uploaded it.
-  - **`audit_events`** — an append-only history keyed by slug: every publish and
-    every revoke is recorded with actor, timestamp, and details. The manifest is
-    mutable (a republish upserts the row); the audit log only ever grows.
+  - **`audit_events`** — an append-only history keyed by slug: every publish,
+    every revoke, and every `view` (document open) is recorded with actor,
+    timestamp, and details. The manifest is mutable (a republish upserts the row);
+    the audit log only ever grows.
 
 Because the row carries an expiry and a revocation timestamp, a share can be
 switched off (`drop revoke <slug>`) or made to lapse **without touching the
@@ -221,7 +222,8 @@ always validates on the other. The Worker compares in constant time.
 drop/
 ├── cli/
 │   ├── drop                     # the CLI (zero-dependency Python 3)
-│   └── drop-gitleaks.toml       # bundled gitleaks config for the preflight
+│   ├── drop-gitleaks.toml       # bundled gitleaks config for the preflight
+│   └── test_drop.py             # offline CLI unit tests (stdlib only)
 ├── worker/
 │   ├── src/worker.mjs           # the edge Worker
 │   ├── schema.sql               # D1 schema: shares + audit_events
@@ -288,10 +290,11 @@ publish images). Symlink `cli/drop` somewhere on your `PATH`.
    conservative (`no-store`) even without them.
 7. **Verify the blast radius:** `drop scope-test`.
 
-### 3. Run the Worker tests
+### 3. Run the tests
 
 ```bash
-cd worker && npm test    # or: node test/worker.test.mjs
+cd worker && npm test         # Worker unit tests — or: node test/worker.test.mjs
+python3 cli/test_drop.py      # CLI unit tests (offline, no creds)
 ```
 
 ---
@@ -305,13 +308,63 @@ drop --unlisted --client "Acme" path/to/report # secret link: no password, ungue
 drop --public path/to/site                     # truly public: no password, guessable URL
 drop --password "$pw" --expire 7d path/to/site # explicit password + 7-day expiry
 drop --dry-run path/to/site                    # run preflight + print the manifest, upload nothing
-drop list                                      # list every share
+drop list                                      # list every share (with a views=N column)
+drop views <slug>                              # who opened it: count + recent timestamps / IPs / UAs
 drop revoke <slug>                             # kill a share (deny + delete objects + purge)
 drop scope-test                                # blast-radius self-check
 ```
 
 A successful private share prints the URL and a generated password; send the
 password out-of-band.
+
+---
+
+## Password shares: a login page, not a browser dialog
+
+A password-protected share shows a clean, self-contained **HTML login page** — one
+password field and a **View** button — instead of the browser's bare two-field
+HTTP Basic dialog. The page carries no external assets, is `noindex`, and shows
+only the share's label.
+
+- On the correct password the Worker replies `303` and sets an **HttpOnly, Secure,
+  SameSite=Lax** cookie scoped to that share's path, so the recipient isn't
+  re-prompted on every asset. The cookie value is a **stateless HMAC** —
+  `base64url(HMAC-SHA256(ADMIN_TOKEN, "v1:<slug>:<verifierHash>"))` — recomputed
+  and constant-time-compared on every request, so there is **no session store**.
+  Because it binds the password verifier, rotating a share's password (a republish
+  with a new one) silently invalidates every old cookie.
+- A wrong password re-renders the page with an error and counts against the same
+  failed-attempt rate limit; a successful load or the login page itself is never
+  throttled.
+- The order of checks is unchanged — **deny → revoke → expiry → auth** — so a
+  revoked or expired share never even renders the login page.
+- **Non-browser / API clients keep using HTTP Basic Auth:** `curl -u
+  anything:<password> https://drop.example.com/<slug>/` still works (the username
+  is ignored; only the password is checked). The Worker **never** sends a
+  `WWW-Authenticate` challenge — that dialog is exactly what the login page
+  replaces.
+- `--public` / `--unlisted` shares have no password and skip the login entirely.
+
+---
+
+## View tracking: did the client open it?
+
+Each time a share's document is opened, the Worker logs one `view` — **one row per
+page open, never per asset.** Only the document itself counts (an `.html` request,
+or a single-file share's lone object such as a lone PDF), and same-IP refreshes
+are deduped within 30 minutes, so one visit is one row rather than thirty. Each row
+records the client IP (`cf-connecting-ip`) and a truncated (≤200-char) User-Agent;
+the write is deferred off the serving hot path so it never delays the viewer's
+bytes. It's your own DocSend-style audit trail:
+
+```bash
+drop list            # adds a views=N column per share
+drop views <slug>    # the total plus recent opens (timestamp / IP / UA)
+```
+
+There's no new table — `view` events reuse `audit_events`. The one schema addition
+is an index (`idx_audit_events_event_slug`); re-running the idempotent
+`worker/schema.sql` against your D1 applies it.
 
 ---
 

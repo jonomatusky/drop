@@ -294,13 +294,19 @@
       </div>
       <div class="feat">
         <h4>The audit trail</h4>
-        <p>A separate <code>audit_events</code> table records what happened to each share over time — creation, access, revocation — as an immutable, append-only history keyed by slug.</p>
+        <p>A separate <code>audit_events</code> table records what happened to each share over time — creation, every open (a <code>view</code>), revocation — as an immutable, append-only history keyed by slug.</p>
       </div>
     </div>
     <p class="muted">
       Because the manifest carries an expiry and a revocation timestamp, a share can be switched off
       (<code>drop revoke &lt;slug&gt;</code>) or made to lapse without touching the stored files —
       the Worker simply refuses to serve a slug the database says is dead.
+    </p>
+    <p class="muted">
+      That same audit log doubles as DocSend-style <strong>view tracking</strong>. Each document open
+      logs one <code>view</code> — one row per page open, never per asset, with same-IP refreshes
+      deduped — capturing the timestamp, client IP, and User-Agent. <code>drop list</code> shows a
+      <code>views=N</code> column and <code>drop views &lt;slug&gt;</code> prints who opened it.
     </p>
   </section>
 
@@ -344,8 +350,10 @@
           <span class="tier-flag">(no flag)</span>
         </div>
         <p>Password-protected. The slug is just a label; the password is the lock, so a guessable name
-          leaks nothing. The password is verified server-side and sent out-of-band. This is what you
-          get if you pass no visibility flag at all.</p>
+          leaks nothing. A browser gets a clean, unbranded login page (not the old HTTP Basic dialog);
+          the password is verified server-side and a stateless, signed cookie keeps the visitor in. API
+          clients still authenticate with <code>curl -u anything:&lt;password&gt;</code>. This is what
+          you get if you pass no visibility flag at all.</p>
         <div class="slug">drop.jonomatus.ky/acme-proposal/ <span style="color:var(--ink-dim)">+ password</span></div>
       </div>
 

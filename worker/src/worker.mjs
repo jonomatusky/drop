@@ -134,6 +134,177 @@ async function verifyPassword(password, verifier) {
   return constantTimeEqual(got, verifier.hash);
 }
 
+// --- password-tier login cookie (stateless MAC, no session store) -----------
+// A successful password login mints an HttpOnly cookie scoped to the slug path.
+// Its value is an HMAC over the slug AND the current password verifier's hash,
+// keyed by the Worker's ADMIN_TOKEN secret. Statelessness: the Worker recomputes
+// and constant-time-compares the MAC on every request — nothing is stored server
+// side. Binding the verifier hash means rotating the password (a republish with a
+// new password) silently invalidates every previously-issued cookie.
+const COOKIE_NAME = "drop_auth";
+const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 12; // 12h browser lifetime
+
+function base64Url(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    const key = part.slice(0, eq).trim();
+    if (key) out[key] = part.slice(eq + 1).trim();
+  }
+  return out;
+}
+
+async function shareCookieToken(env, slug, verifier) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    TEXT_ENCODER.encode(env.ADMIN_TOKEN || ""),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const message = `v1:${slug}:${verifier?.hash || ""}`;
+  const sig = await crypto.subtle.sign("HMAC", key, TEXT_ENCODER.encode(message));
+  return base64Url(new Uint8Array(sig));
+}
+
+async function validShareCookie(env, slug, cookieValue, verifier) {
+  if (!cookieValue) return false;
+  const expected = await shareCookieToken(env, slug, verifier);
+  return constantTimeEqual(cookieValue, expected);
+}
+
+function cookieHeader(slug, token) {
+  // Path is `/<slug>` WITHOUT a trailing slash on purpose. A `/<slug>/` path
+  // would not be sent on a request to the slash-less `/<slug>` (cookie path
+  // matching: `/<slug>/` is not a prefix of `/<slug>`), so a recipient who opens
+  // the slug without the trailing slash would log in, get redirected back to
+  // `/<slug>`, send no cookie, and loop on the login page forever. `/<slug>`
+  // matches both `/<slug>` and `/<slug>/...` and still scopes to exactly this
+  // slug (a sibling like `/<slug>-2/` is not a path-match).
+  return `${COOKIE_NAME}=${token}; Path=/${slug}; Max-Age=${COOKIE_MAX_AGE_SECONDS}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Minimal, unbranded, fully self-contained login page (no external assets). Shows
+// the share label as a heading; otherwise reveals nothing. Served instead of the
+// old HTTP Basic dialog so browsers get a clean, professional, client-facing page.
+function loginPage(share, { error = false } = {}) {
+  const heading = escapeHtml(share.label || "Protected document");
+  const errorBlock = error
+    ? '<p class="err" role="alert">Incorrect password. Please try again.</p>'
+    : "";
+  const body = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>${heading}</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #f3f4f6; color: #111827; padding: 24px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .card {
+    width: 100%; max-width: 360px; background: #ffffff; border: 1px solid #e5e7eb;
+    border-radius: 12px; padding: 32px 28px; box-shadow: 0 1px 3px rgba(0,0,0,.08);
+  }
+  .lock { font-size: 28px; text-align: center; margin-bottom: 12px; }
+  h1 { font-size: 18px; font-weight: 600; text-align: center; margin: 0 0 6px; line-height: 1.3; }
+  .sub { font-size: 13px; color: #6b7280; text-align: center; margin: 0 0 20px; }
+  label { display: block; font-size: 12px; font-weight: 600; color: #374151; margin-bottom: 6px; }
+  input[type=password] {
+    width: 100%; padding: 10px 12px; font-size: 15px; border: 1px solid #d1d5db;
+    border-radius: 8px; background: #fff; color: #111827;
+  }
+  input[type=password]:focus { outline: 2px solid #2563eb; outline-offset: 1px; border-color: #2563eb; }
+  button {
+    width: 100%; margin-top: 16px; padding: 10px 12px; font-size: 15px; font-weight: 600;
+    color: #fff; background: #111827; border: 0; border-radius: 8px; cursor: pointer;
+  }
+  button:hover { background: #374151; }
+  .err { font-size: 13px; color: #b91c1c; text-align: center; margin: 0 0 14px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #0b0f17; color: #e5e7eb; }
+    .card { background: #111827; border-color: #1f2937; box-shadow: none; }
+    h1 { color: #f9fafb; }
+    label { color: #d1d5db; }
+    input[type=password] { background: #0b0f17; border-color: #374151; color: #f9fafb; }
+    button { background: #2563eb; }
+    button:hover { background: #1d4ed8; }
+  }
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="lock" aria-hidden="true">&#128274;</div>
+    <h1>${heading}</h1>
+    <p class="sub">This document is password-protected.</p>
+    ${errorBlock}
+    <form method="POST" autocomplete="off">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autofocus required autocomplete="current-password">
+      <button type="submit">View</button>
+    </form>
+  </main>
+</body>
+</html>
+`;
+  return new Response(body, {
+    status: 200,
+    headers: securityHeaders({
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'",
+    }),
+  });
+}
+
+function loginRedirect(request, slug, token) {
+  const url = new URL(request.url);
+  return new Response(null, {
+    status: 303,
+    headers: {
+      ...securityHeaders(),
+      location: url.pathname,
+      "set-cookie": cookieHeader(slug, token),
+    },
+  });
+}
+
+async function readFormPassword(request) {
+  const contentType = request.headers.get("content-type") || "";
+  try {
+    if (contentType.includes("application/x-www-form-urlencoded")) {
+      return new URLSearchParams(await request.text()).get("password") || "";
+    }
+    if (contentType.includes("multipart/form-data")) {
+      return (await request.formData()).get("password") || "";
+    }
+  } catch {
+    return "";
+  }
+  return "";
+}
+
 async function readShare(env, slug) {
   const row = await env.DB.prepare(
     "SELECT slug, label, auth_mode, sha256, files_json, bytes, scan_result_json, created_at, expires_at, revoked_at, uploader FROM shares WHERE slug = ?",
@@ -174,30 +345,73 @@ async function enforceRateLimit(env, request, slug) {
 
 async function requireShareAuth(env, request, share) {
   if (share.auth_mode === "public") return { ok: true };
-  // Throttle only failed/unauthenticated attempts — never a successful load.
-  // A legitimate viewer's browser replays valid Basic Auth on every asset, so
-  // rate-limiting before the password check would 429 a real visitor loading
-  // more than RATE_LIMIT_MAX files (CSS/JS/images) from one IP.
-  const auth = parseBasicAuth(request.headers.get("authorization"));
-  if (!auth || !auth.password) {
-    if (!(await enforceRateLimit(env, request, share.slug))) return { ok: false, response: rateLimited() };
-    return {
-      ok: false,
-      response: new Response("authentication required\n", {
-        status: 401,
-        headers: { ...securityHeaders({ "content-type": "text/plain; charset=utf-8" }), "www-authenticate": `Basic realm="${share.slug}", charset="UTF-8"` },
-      }),
-    };
+  const slug = share.slug;
+  const verifier = await env.AUTH_KV.get(`auth:${slug}`, { type: "json" });
+
+  // Rate limiting throttles only failed PASSWORD attempts — never a successful
+  // load, and never the (assetless) login page itself. Serving the login page or
+  // a cookie-authenticated document does no PBKDF2 work and reveals nothing, so
+  // there is nothing to throttle there.
+
+  // 1) A valid login cookie (browser already authenticated). Path-scoped to the
+  //    slug and MAC-bound to slug + verifier, so a forged or foreign-slug cookie
+  //    fails the constant-time compare and falls through to the login page.
+  const cookies = parseCookies(request.headers.get("cookie"));
+  if (cookies[COOKIE_NAME] && (await validShareCookie(env, slug, cookies[COOKIE_NAME], verifier))) {
+    return { ok: true };
   }
-  const verifier = await env.AUTH_KV.get(`auth:${share.slug}`, { type: "json" });
-  if (!(await verifyPassword(auth.password, verifier))) {
-    if (!(await enforceRateLimit(env, request, share.slug))) return { ok: false, response: rateLimited() };
+
+  // 2) HTTP Basic Auth, kept so non-browser/API clients (`curl -u x:pw …`) still
+  //    work. curl sends Basic preemptively, so no WWW-Authenticate challenge is
+  //    needed — and we deliberately never send one (that dialog is what we're
+  //    replacing). The username is ignored; only the password is checked.
+  const auth = parseBasicAuth(request.headers.get("authorization"));
+  if (auth && auth.password) {
+    if (await verifyPassword(auth.password, verifier)) return { ok: true };
+    if (!(await enforceRateLimit(env, request, slug))) return { ok: false, response: rateLimited() };
     return { ok: false, response: forbidden("forbidden") };
   }
-  return { ok: true };
+
+  // 3) Login form submission (browser POST). On success, set the cookie and
+  //    redirect (POST→303→GET) so a refresh never re-posts the password.
+  if (request.method === "POST") {
+    const password = await readFormPassword(request);
+    if (password && (await verifyPassword(password, verifier))) {
+      const token = await shareCookieToken(env, slug, verifier);
+      return { ok: false, response: loginRedirect(request, slug, token) };
+    }
+    if (!(await enforceRateLimit(env, request, slug))) return { ok: false, response: rateLimited() };
+    return { ok: false, response: loginPage(share, { error: true }) };
+  }
+
+  // 4) Unauthenticated browser request → serve the clean HTML login page.
+  return { ok: false, response: loginPage(share) };
 }
 
-async function serveArtifact(request, env, url) {
+// One `view` audit row per page open, never per asset. A page load pulls many
+// sub-assets (CSS/JS/images) from one IP; only the document itself counts, and a
+// short KV dedupe window collapses refreshes and any straggler into one row.
+const VIEW_DEDUPE_TTL_SECONDS = 60 * 30; // 30 min
+const MAX_UA_LENGTH = 200;
+
+function isDocumentView(share, objectPath) {
+  const ext = extname(objectPath);
+  if (ext === ".html" || ext === ".htm") return true;
+  // A single-file share's only object IS the document (e.g. a lone PDF/image).
+  return share.files.length === 1 && objectPath === share.files[0].path;
+}
+
+async function logView(env, request, share, objectPath) {
+  if (!isDocumentView(share, objectPath)) return;
+  const ip = request.headers.get("cf-connecting-ip") || "unknown";
+  const dedupeKey = `view:${share.slug}:${ip}`;
+  if (await env.AUTH_KV.get(dedupeKey)) return;
+  const ua = (request.headers.get("user-agent") || "").slice(0, MAX_UA_LENGTH);
+  await env.AUTH_KV.put(dedupeKey, "1", { expirationTtl: VIEW_DEDUPE_TTL_SECONDS });
+  await recordAudit(env, share.slug, "view", ip, { ip, ua });
+}
+
+async function serveArtifact(request, env, url, ctx) {
   const parsed = parseSlug(url);
   if (!parsed || !parsed.path) return notFound();
   const { slug, path } = parsed;
@@ -231,7 +445,18 @@ async function serveArtifact(request, env, url) {
     "etag": object.httpEtag || undefined,
   });
   if (request.method === "HEAD") return new Response(null, { status: 200, headers });
-  return new Response(object.body, { status: 200, headers });
+  const response = new Response(object.body, { status: 200, headers });
+  // Count the open only on a real document GET (not HEAD prefetch, not the login
+  // POST). Asset requests and refreshes are filtered/deduped inside logView.
+  // Keep view tracking fully off the serving hot path: schedule it via
+  // ctx.waitUntil so the viewer's bytes never wait on the dedupe read or the
+  // audit write. With no ctx (unit tests) await it so the row is observable.
+  if (request.method === "GET") {
+    const tracking = logView(env, request, share, objectPath);
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(tracking);
+    else await tracking;
+  }
+  return response;
 }
 
 async function requireAdmin(request, env) {
@@ -245,13 +470,37 @@ async function listShares(env) {
   const result = await env.DB.prepare(
     "SELECT slug, label, auth_mode, sha256, files_json, bytes, scan_result_json, created_at, expires_at, revoked_at, uploader FROM shares ORDER BY created_at DESC",
   ).all();
+  const viewCounts = await env.DB.prepare(
+    "SELECT slug, COUNT(*) AS views FROM audit_events WHERE event = 'view' GROUP BY slug",
+  ).all();
+  const counts = new Map((viewCounts.results || []).map((row) => [row.slug, row.views]));
   return (result.results || []).map((row) => ({
     ...row,
     files: JSON.parse(row.files_json || "[]"),
     scan_result: JSON.parse(row.scan_result_json || "{}"),
     files_json: undefined,
     scan_result_json: undefined,
+    views: counts.get(row.slug) || 0,
   }));
+}
+
+async function viewsForSlug(env, slug, limit = 50) {
+  const countRow = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM audit_events WHERE slug = ? AND event = 'view'",
+  ).bind(slug).first();
+  const recent = await env.DB.prepare(
+    "SELECT created_at, details_json FROM audit_events WHERE slug = ? AND event = 'view' ORDER BY created_at DESC LIMIT ?",
+  ).bind(slug, limit).all();
+  const views = (recent.results || []).map((row) => {
+    let details = {};
+    try {
+      details = JSON.parse(row.details_json || "{}");
+    } catch {
+      details = {};
+    }
+    return { at: row.created_at, ip: details.ip || null, ua: details.ua || null };
+  });
+  return { slug, count: countRow?.count || 0, views };
 }
 
 async function upsertManifest(request, env) {
@@ -359,16 +608,24 @@ async function revokeShare(request, env) {
 async function handleAdmin(request, env, url) {
   if (!(await requireAdmin(request, env))) return forbidden("admin forbidden");
   if (request.method === "GET" && url.pathname === "/admin/list") return json({ shares: await listShares(env) });
+  if (request.method === "GET" && url.pathname === "/admin/views") {
+    const slug = url.searchParams.get("slug");
+    if (!slug) return badRequest("missing slug");
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 500);
+    return json(await viewsForSlug(env, slug, limit));
+  }
   if (request.method === "POST" && url.pathname === "/admin/manifest") return upsertManifest(request, env);
   if (request.method === "POST" && url.pathname === "/admin/revoke") return revokeShare(request, env);
   return notFound();
 }
 
-async function fetchHandler(request, env) {
+async function fetchHandler(request, env, ctx) {
   const url = new URL(request.url);
   if (url.pathname.startsWith("/admin/")) return handleAdmin(request, env, url);
-  if (!["GET", "HEAD"].includes(request.method)) return new Response("method not allowed\n", { status: 405, headers: securityHeaders() });
-  return serveArtifact(request, env, url);
+  // POST is allowed so password shares can accept the login form; serveArtifact
+  // routes it through requireShareAuth (a POST to a public share just serves).
+  if (!["GET", "HEAD", "POST"].includes(request.method)) return new Response("method not allowed\n", { status: 405, headers: securityHeaders() });
+  return serveArtifact(request, env, url, ctx);
 }
 
 export {
@@ -378,6 +635,7 @@ export {
   parseBasicAuth,
   parseSlug,
   safePath,
+  shareCookieToken,
   verifyPassword,
 };
 
