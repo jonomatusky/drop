@@ -26,3 +26,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_audit_events_slug_created_at
   ON audit_events(slug, created_at DESC);
+
+-- View tracking: `view` events share the audit_events table. This index serves
+-- the per-event aggregates — total opens per slug for `drop list`, and the
+-- `WHERE event = 'view' GROUP BY slug` rollup.
+CREATE INDEX IF NOT EXISTS idx_audit_events_event_slug
+  ON audit_events(event, slug);
