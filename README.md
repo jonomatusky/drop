@@ -15,9 +15,9 @@ things *in*, `drop` puts a finished artifact *out*.
 This is **personal, self-hostable, open-source infrastructure** — a tool you
 deploy to *your own* Cloudflare account. It is **not** a hosted product and there
 is nothing to sign up for. The author's deployment runs at
-**[drop.jonomatus.ky](https://drop.jonomatus.ky)**, and there's a live writeup of
-the design (published with the tool itself) at
-**<https://drop.jonomatus.ky/how-drop-works/>** (the source of that page lives in
+**[drop.jonomatus.ky](https://drop.jonomatus.ky)**, and there's a live demo —
+this very page, published with the tool itself — at
+**<https://drop.jonomatus.ky/demo/>** (the source of that page lives in
 [`web/index.html`](web/index.html)).
 
 ---
@@ -113,7 +113,7 @@ purely a difference in how the **slug** is shaped (entirely CLI-side).
 |------|------|------|-----------|------------|
 | **Private** *(default)* | *(none)* | password | clean `…/acme-proposal/` | drafts, anything you'll gate — send the password out-of-band |
 | **Unlisted** | `--unlisted` | none | readable + ~82-bit tail `…/acme-proposal-k7f3m9q2x8p4n6tz/` | a link you want frictionless but not enumerable — the URL *is* the key |
-| **Public** | `--public` | none | clean `…/how-drop-works/` | content meant to be discoverable |
+| **Public** | `--public` | none | clean `…/demo/` | content meant to be discoverable |
 
 - **Private** is the default. The slug is just a label; the password is the lock,
   verified server-side (PBKDF2) and sent out-of-band — so a guessable name leaks
@@ -406,5 +406,5 @@ is an index (`idx_audit_events_event_slug`); re-running the idempotent
 Built by [jonomatusky](https://x.com/jonomatusky). MIT licensed — see
 [`LICENSE`](LICENSE).
 
-Live design writeup (published with the tool itself):
-<https://drop.jonomatus.ky/how-drop-works/>
+Live demo (this page, published with the tool itself):
+<https://drop.jonomatus.ky/demo/>
