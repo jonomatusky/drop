@@ -7,8 +7,14 @@ const MIME_TYPES = {
   ".js": "application/javascript; charset=utf-8",
   ".mjs": "application/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
   ".txt": "text/plain; charset=utf-8",
   ".md": "text/markdown; charset=utf-8",
+  ".csv": "text/csv; charset=utf-8",
+  ".xml": "application/xml; charset=utf-8",
+  ".yaml": "text/plain; charset=utf-8",
+  ".yml": "text/plain; charset=utf-8",
+  ".log": "text/plain; charset=utf-8",
   ".svg": "image/svg+xml",
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -17,6 +23,37 @@ const MIME_TYPES = {
   ".webp": "image/webp",
   ".pdf": "application/pdf",
 };
+
+// Formats a browser decodes as text, and will therefore misdecode if we do not
+// say which encoding it is in.
+const TEXTUAL_TYPE_RE = /^text\/|^application\/(javascript|ecmascript|json|xml)\b|\+xml\b|\+json\b/i;
+
+function withCharset(contentType) {
+  if (!contentType || /;\s*charset=/i.test(contentType)) return contentType;
+  return TEXTUAL_TYPE_RE.test(contentType) ? `${contentType}; charset=utf-8` : contentType;
+}
+
+// The content type we SERVE, which is not the one the uploader stored.
+//
+// R2 keeps whatever content type the upload set, and the CLI derives that from
+// Python's mimetypes, which returns a bare `text/html` with no charset. That
+// stored value used to win outright over the table above, so every HTML page
+// drop served went out as `content-type: text/html` — no charset at all. A
+// browser that is told nothing falls back to a locale default (Windows-1252 in
+// practice), so a genuinely UTF-8 page renders curly quotes and em dashes as
+// mojibake: "don't" becomes "donâ€™t". `x-content-type-options: nosniff` closes
+// the browser's usual escape hatch, so it cannot recover by sniffing a BOM or a
+// <meta charset> either. A page with its own <meta charset> happened to survive;
+// one without it did not, which is why this looked intermittent.
+//
+// So: the extension table is authoritative for the types we know, R2's metadata
+// covers the rest, and anything textual that still arrives without a charset
+// gets one. Serving is computed per request, so this repairs every share already
+// in the bucket — no republish needed.
+function contentTypeFor(objectPath, object) {
+  const known = MIME_TYPES[extname(objectPath)];
+  return withCharset(known || object?.httpMetadata?.contentType || "application/octet-stream");
+}
 
 function json(body, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(body, null, 2), {
@@ -441,7 +478,7 @@ async function serveArtifact(request, env, url, ctx) {
   if (!object) return notFound();
 
   const headers = securityHeaders({
-    "content-type": object.httpMetadata?.contentType || MIME_TYPES[extname(objectPath)] || "application/octet-stream",
+    "content-type": contentTypeFor(objectPath, object),
     "etag": object.httpEtag || undefined,
   });
   if (request.method === "HEAD") return new Response(null, { status: 200, headers });
@@ -630,6 +667,7 @@ async function fetchHandler(request, env, ctx) {
 
 export {
   constantTimeEqual,
+  contentTypeFor,
   fetchHandler,
   isExpired,
   parseBasicAuth,

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
-import { constantTimeEqual, fetchHandler, parseSlug, shareCookieToken } from "../src/worker.mjs";
+import { constantTimeEqual, contentTypeFor, fetchHandler, parseSlug, shareCookieToken } from "../src/worker.mjs";
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
@@ -39,6 +39,22 @@ class KV {
   }
 }
 
+// Mirrors what the CLI actually stored in R2 for years: Python's mimetypes guess,
+// which is a BARE type with no charset (`text/html`, not `text/html; charset=utf-8`).
+// The old mock hardcoded a charset on every object, which is why the missing-charset
+// bug never showed up here. Anything the guess does not cover has no stored type
+// at all, the other case the serving path has to handle.
+const STORED_CONTENT_TYPES = {
+  ".html": "text/html",
+  ".htm": "text/html",
+  ".css": "text/css",
+  ".js": "text/javascript",
+  ".json": "application/json",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".pdf": "application/pdf",
+};
+
 class R2 {
   constructor(objects = {}) {
     this.objects = new Map(Object.entries(objects));
@@ -46,7 +62,13 @@ class R2 {
   async get(key) {
     const value = this.objects.get(key);
     if (!value) return null;
-    return { body: value, httpMetadata: { contentType: "text/html; charset=utf-8" }, httpEtag: '"test"' };
+    const dot = key.lastIndexOf(".");
+    const stored = STORED_CONTENT_TYPES[dot >= 0 ? key.slice(dot).toLowerCase() : ""];
+    return {
+      body: value,
+      httpMetadata: stored ? { contentType: stored } : {},
+      httpEtag: '"test"',
+    };
   }
   async list({ prefix }) {
     return {
@@ -269,6 +291,114 @@ assert.equal(constantTimeEqual("same", "diff"), false);
   assert.equal(stale.status, 404);
   const live = await fetchHandler(new Request("https://share.example.test/s1/", { headers: { authorization: auth } }), env);
   assert.equal(live.status, 200);
+}
+
+// === Encoding: every text response must name its charset ====================
+//
+// The bug: R2 stores the content type the CLI guessed (a bare `text/html`), and
+// that stored value used to win over the extension table. So drop served
+// `content-type: text/html` with no charset, browsers fell back to a locale
+// default, and UTF-8 curly quotes/em dashes rendered as mojibake ("â€œ") on any
+// page that had no <meta charset> of its own.
+
+{
+  // Unit: the served type, for each way a type can arrive.
+  const stored = (contentType) => ({ httpMetadata: { contentType } });
+
+  // Known extension wins outright, charset-less R2 metadata notwithstanding.
+  assert.equal(contentTypeFor("index.html", stored("text/html")), "text/html; charset=utf-8");
+  assert.equal(contentTypeFor("style.css", stored("text/css")), "text/css; charset=utf-8");
+  assert.equal(contentTypeFor("app.js", stored("text/javascript")), "application/javascript; charset=utf-8");
+  assert.equal(contentTypeFor("data.json", stored("application/json")), "application/json; charset=utf-8");
+  assert.equal(contentTypeFor("notes.md", stored("text/markdown")), "text/markdown; charset=utf-8");
+  assert.equal(contentTypeFor("rows.csv", stored("text/csv")), "text/csv; charset=utf-8");
+
+  // Unknown extension: fall back to R2's type, and repair it if it is textual.
+  assert.equal(contentTypeFor("feed.atom", stored("application/atom+xml")), "application/atom+xml; charset=utf-8");
+  assert.equal(contentTypeFor("notes.rst", stored("text/x-rst")), "text/x-rst; charset=utf-8");
+  assert.equal(contentTypeFor("f.woff2", stored("font/woff2")), "font/woff2");
+  assert.equal(contentTypeFor("clip.mp4", stored("video/mp4")), "video/mp4");
+
+  // A charset already present is respected, never doubled — including a
+  // deliberate non-UTF-8 one.
+  assert.equal(contentTypeFor("legacy.unknownext", stored("text/html; charset=iso-8859-1")), "text/html; charset=iso-8859-1");
+  assert.equal(contentTypeFor("x.unknownext", stored("text/plain;charset=utf-8")), "text/plain;charset=utf-8");
+
+  // Binary types must NOT be given a charset — that would be meaningless at best.
+  assert.equal(contentTypeFor("og.png", stored("image/png")), "image/png");
+  assert.equal(contentTypeFor("deck.pdf", stored("application/pdf")), "application/pdf");
+  // SVG is markup and does carry text, so it does get one.
+  assert.equal(contentTypeFor("logo.svg", stored("image/svg+xml")), "image/svg+xml; charset=utf-8");
+
+  // No stored metadata at all, and no known extension: the safe binary default.
+  assert.equal(contentTypeFor("blob.unknownext", {}), "application/octet-stream");
+  assert.equal(contentTypeFor("blob.unknownext", null), "application/octet-stream");
+  // No stored metadata but a known extension: the table still answers.
+  assert.equal(contentTypeFor("index.html", {}), "text/html; charset=utf-8");
+}
+
+{
+  // End-to-end: the served document declares UTF-8, and the UTF-8 bytes survive
+  // the round trip. This is the exact repro — a page with NO <meta charset>.
+  const env = await envFor({ public: row("public", { auth_mode: "public" }) });
+  const body = "<html><body>“curly” — em dash</body></html>";
+  env.ARTIFACTS.objects.set("public/index.html", body);
+  const res = await fetchHandler(new Request("https://share.example.test/public/"), env);
+  assert.equal(res.status, 200);
+  assert.equal(
+    res.headers.get("content-type"),
+    "text/html; charset=utf-8",
+    "HTML must be served with an explicit charset — without it browsers guess a locale default and mojibake UTF-8",
+  );
+  assert.equal(await res.text(), body, "UTF-8 punctuation survives the round trip");
+}
+
+{
+  // The fix is computed at serve time, so it repairs shares ALREADY in the
+  // bucket — objects whose stored metadata is the old charset-less guess. No
+  // republish is needed to un-break an existing drop.
+  const env = await envFor({ public: row("public", { auth_mode: "public" }) });
+  const object = await env.ARTIFACTS.get("public/index.html");
+  assert.equal(object.httpMetadata.contentType, "text/html", "the stored metadata is still the old, broken value");
+  const res = await fetchHandler(new Request("https://share.example.test/public/"), env);
+  assert.match(res.headers.get("content-type"), /charset=utf-8/i, "an existing object is repaired on the way out");
+}
+
+{
+  // Sub-assets have the same problem: a CSS or JS file with UTF-8 content served
+  // without a charset is decoded wrong too, and no meta tag can rescue those.
+  const env = await envFor({
+    public: row("public", {
+      auth_mode: "public",
+      files_json: JSON.stringify([{ path: "index.html" }, { path: "app.css" }, { path: "app.js" }, { path: "logo.png" }]),
+    }),
+  });
+  env.ARTIFACTS.objects.set("public/app.css", 'body::after{content:"—"}');
+  env.ARTIFACTS.objects.set("public/app.js", 'const dash = "—";');
+  env.ARTIFACTS.objects.set("public/logo.png", "PNG");
+  const typeOf = async (path) =>
+    (await fetchHandler(new Request(`https://share.example.test/public/${path}`), env)).headers.get("content-type");
+  assert.equal(await typeOf("app.css"), "text/css; charset=utf-8");
+  assert.equal(await typeOf("app.js"), "application/javascript; charset=utf-8");
+  assert.equal(await typeOf("logo.png"), "image/png", "images must not be handed a charset");
+}
+
+{
+  // HEAD returns the same headers as GET, charset included — a client that
+  // preflights must not see a different content type than the body it then gets.
+  const env = await envFor({ public: row("public", { auth_mode: "public" }) });
+  const head = await fetchHandler(new Request("https://share.example.test/public/", { method: "HEAD" }), env);
+  assert.equal(head.headers.get("content-type"), "text/html; charset=utf-8");
+}
+
+{
+  // The login page is generated by the Worker, not read from R2 — it already
+  // declares UTF-8 and must keep doing so (its heading echoes the share label,
+  // which can be any Unicode the publisher chose).
+  const env = await envFor({ s1: row("s1", { label: "Café — Proposal" }) }, { "auth:s1": JSON.stringify(await verifier("pw")) });
+  const res = await fetchHandler(new Request("https://share.example.test/s1/"), env);
+  assert.equal(res.headers.get("content-type"), "text/html; charset=utf-8");
+  assert.match(await res.text(), /Café — Proposal/, "a Unicode label renders intact on the login page");
 }
 
 // === Feature 1: password-tier HTML login page (replaces HTTP Basic dialog) ===
