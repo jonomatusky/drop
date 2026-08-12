@@ -109,7 +109,46 @@ print("slug prettify")
 check("random tail stripped + title-cased", drop._prettify_slug("how-jono-ai-works-r4lqf6t7nt27drdt") == "How Jono Ai Works")
 check("plain slug prettified", drop._prettify_slug("acme-proposal") == "Acme Proposal")
 
-print("staging (build_card_assets)")
+print("charset declaration detection")
+check("modern <meta charset> detected", drop.declares_charset('<head><meta charset="utf-8"></head>'))
+check("unquoted charset detected", drop.declares_charset("<head><meta charset=utf-8></head>"))
+check("single-quoted charset detected", drop.declares_charset("<head><meta charset='UTF-8'></head>"))
+check(
+    "legacy http-equiv Content-Type detected",
+    drop.declares_charset('<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">'),
+)
+check("no declaration -> False", not drop.declares_charset("<html><head><title>T</title></head></html>"))
+check("charset in body text is not a declaration", not drop.declares_charset("<p>the charset = utf-8 setting</p>"))
+
+print("charset injection")
+out = drop.inject_charset_meta("<html><head><title>T</title></head><body>hi</body></html>")
+check("meta charset injected", '<meta charset="utf-8">' in out)
+check("injected first in <head>, before the title", out.index('<meta charset="utf-8">') < out.index("<title>"))
+check("lands well inside the 1024-byte prescan window", out.index('<meta charset="utf-8">') < 1024)
+check("body preserved", "<body>hi</body>" in out)
+# An author's own declaration is never overwritten — including a non-UTF-8 one.
+latin = '<html><head><meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1"></head></html>'
+check("existing declaration left alone", drop.inject_charset_meta(latin) == latin)
+already = '<html><head><meta charset="utf-8"><title>T</title></head></html>'
+check("idempotent: no second charset meta", drop.inject_charset_meta(already).count("charset=") == 1)
+# Documents that do not have a <head> still get the tag, in a position that counts.
+nohead = drop.inject_charset_meta("<!DOCTYPE html>\n<html><body>x</body></html>")
+check("no <head>: injected after the doctype", nohead.index("<!DOCTYPE html>") < nohead.index('<meta charset="utf-8">'))
+check("no <head>: injected before the content", nohead.index('<meta charset="utf-8">') < nohead.index("<body>"))
+bare = drop.inject_charset_meta("<p>hi</p>")
+check("no doctype and no head: tag leads the document", bare.startswith('<meta charset="utf-8">'))
+
+print("upload content types carry a charset")
+check("html gets utf-8", drop.content_type_for("index.html") == "text/html; charset=utf-8")
+check("css gets utf-8", drop.content_type_for("a/style.css") == "text/css; charset=utf-8")
+check("js gets utf-8", "charset=utf-8" in drop.content_type_for("app.js"))
+check("json gets utf-8", "charset=utf-8" in drop.content_type_for("data.json"))
+check("svg gets utf-8", "charset=utf-8" in drop.content_type_for("logo.svg"))
+check("png does NOT get a charset", drop.content_type_for("og.png") == "image/png")
+check("pdf does NOT get a charset", drop.content_type_for("deck.pdf") == "application/pdf")
+check("unknown extension falls back to octet-stream", drop.content_type_for("x.unknownext") == "application/octet-stream")
+
+print("staging (stage_publish_set)")
 
 
 class _Args:
@@ -119,6 +158,11 @@ class _Args:
     card_accent = None
     client = None
     label = None
+    no_card = False
+
+
+class _NoCardArgs(_Args):
+    no_card = True
 
 
 with tempfile.TemporaryDirectory() as d:
@@ -126,15 +170,18 @@ with tempfile.TemporaryDirectory() as d:
     (root / "index.html").write_text("<html><head><title>Doc</title></head><body>hi</body></html>")
     (root / "style.css").write_text("body{color:red}")
     files = [(root / "index.html", "index.html"), (root / "style.css", "style.css")]
-    staged, tmp, note = drop.build_card_assets(files, "my-slug", "https://drop.example.com", _Args())
+    staged, tmp, note, warns = drop.stage_publish_set(files, "my-slug", "https://drop.example.com", _Args())
     try:
         rels = {rel for _, rel in staged}
         check("og.png added to staged set", "og.png" in rels)
         check("css passed through unchanged", "style.css" in rels)
         injected = next(p for p, rel in staged if rel == "index.html").read_text()
         check("staged index.html has og:image to the resolved slug", "https://drop.example.com/my-slug/og.png" in injected)
+        check("staged index.html also got a charset meta", '<meta charset="utf-8">' in injected)
+        check("charset precedes the og block", injected.index('<meta charset="utf-8">') < injected.index(drop._OG_BLOCK_START))
         check("card title defaults to page <title>", note["title"] == "Doc")
         check("og.png on disk is a valid PNG", png_dimensions((Path(tmp.name) / "og.png").read_bytes()) == (1200, 630))
+        check("charset fix is reported as a warning", any("charset" in w for w in warns))
     finally:
         tmp.cleanup()
 
@@ -143,10 +190,57 @@ with tempfile.TemporaryDirectory() as d:
     root = Path(d)
     (root / "report.html").write_text("<html><head><title>Report</title></head><body>r</body></html>")
     files = [(root / "report.html", "report.html")]
-    staged, tmp, note = drop.build_card_assets(files, "rep", "https://drop.example.com", _Args())
+    staged, tmp, note, _ = drop.stage_publish_set(files, "rep", "https://drop.example.com", _Args())
     try:
         rels = {rel for _, rel in staged}
         check("single html file is staged as index.html", "index.html" in rels and "report.html" not in rels)
+    finally:
+        tmp.cleanup()
+
+# --no-card still fixes the charset: a saved-to-disk copy has no header to lean on.
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d)
+    (root / "report.html").write_text(
+        "<html><head><title>R</title></head><body>“quoted” — dash</body></html>", encoding="utf-8"
+    )
+    files = [(root / "report.html", "report.html")]
+    staged, tmp, note, warns = drop.stage_publish_set(files, "rep", "https://drop.example.com", _NoCardArgs())
+    try:
+        rels = {rel for _, rel in staged}
+        check("--no-card adds no og.png", "og.png" not in rels)
+        check("--no-card returns no card note", note is None)
+        check("--no-card keeps the original filename", "report.html" in rels)
+        page = next(p for p, rel in staged if rel == "report.html").read_text(encoding="utf-8")
+        check("--no-card still injects the charset meta", '<meta charset="utf-8">' in page)
+        check("--no-card injects no og block", drop._OG_BLOCK_START not in page)
+        check("curly quotes and em dash survive the rewrite", "“quoted” — dash" in page)
+    finally:
+        tmp.cleanup()
+
+# A page that already declares UTF-8 is not touched, and produces no warning.
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d)
+    (root / "index.html").write_text('<html><head><meta charset="utf-8"><title>T</title></head><body>x</body></html>')
+    files = [(root / "index.html", "index.html")]
+    staged, tmp, note, warns = drop.stage_publish_set(files, "s", "https://drop.example.com", _NoCardArgs())
+    try:
+        page = next(p for p, rel in staged if rel == "index.html").read_text(encoding="utf-8")
+        check("already-declared page keeps exactly one charset meta", page.count("charset=") == 1)
+        check("no warning for an already-correct page", warns == [])
+    finally:
+        tmp.cleanup()
+
+# Non-UTF-8 HTML is published byte-for-byte rather than silently mangled.
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d)
+    raw = "<html><head><title>T</title></head><body>café — dash</body></html>".encode("cp1252")
+    (root / "index.html").write_bytes(raw)
+    files = [(root / "index.html", "index.html")]
+    staged, tmp, note, warns = drop.stage_publish_set(files, "s", "https://drop.example.com", _NoCardArgs())
+    try:
+        out_bytes = next(p for p, rel in staged if rel == "index.html").read_bytes()
+        check("non-UTF-8 HTML is copied byte-for-byte", out_bytes == raw)
+        check("non-UTF-8 HTML is warned about", any("UTF-8" in w for w in warns))
     finally:
         tmp.cleanup()
 

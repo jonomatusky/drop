@@ -158,6 +158,33 @@ multi-file.)
 
 ---
 
+## Text encoding: everything is UTF-8, and says so
+
+Text served without a declared encoding is decoded with whatever default the
+browser's locale suggests — historically Windows-1252. A genuinely UTF-8 page
+then renders `—` as `â€"` and `"` as `â€œ`: the classic mojibake. Because
+`drop` sends `x-content-type-options: nosniff`, the browser can't rescue itself
+by sniffing the bytes either. `drop` closes this in two independent places:
+
+- **The Worker names the charset on every text response.** Its extension table is
+  authoritative, so `.html`, `.css`, `.js`, `.json`, `.svg`, `.md`, `.csv`, `.xml`
+  and friends always go out as `…; charset=utf-8`, and any other textual type is
+  given a charset on the way out. This is computed per request, not baked at
+  upload — so deploying it repairs **every share already in the bucket**, with no
+  republish. Binary types (`.png`, `.pdf`, fonts, video) are left alone.
+- **The CLI gives HTML its own `<meta charset="utf-8">`** when the page declares
+  no encoding, and stores charset-bearing content types on the uploaded objects.
+  The meta tag is what saves the copy that leaves HTTP behind — a page someone
+  downloads and reopens from disk, or forwards as an attachment, arrives with no
+  header at all.
+
+Rewrites happen in a temp staging copy; your source files are never modified. A
+page that already declares an encoding is left exactly as the author wrote it,
+including a deliberate non-UTF-8 one, and HTML that isn't valid UTF-8 is
+published byte-for-byte with a warning rather than silently mangled.
+
+---
+
 ## The load-bearing detail: a bucket-scoped R2 token, over S3
 
 The most deliberate design choice is about **blast radius**. The Cloudflare
