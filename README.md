@@ -101,6 +101,37 @@ and takes the readable name if it's free. If it's taken, it appends `-2`, `-3`, 
   never has to. (`--slug` forces an exact slug and skips the clash check — that's
   how a known share republishes in place.)
 
+### Republishing in place
+
+There's no `update` subcommand — `--slug` is one. An exact slug skips the clash
+resolver, so the bytes upload onto that slug's own prefix and the manifest row is
+upserted where it already sits, clearing any revocation. `created_at` and the
+view history survive.
+
+```bash
+drop --slug quarterly-report --password "$pw" build/report.html
+```
+
+Three things that bite:
+
+- **The manifest is rebuilt from this run's flags alone** — nothing merges with
+  the row you're replacing. Omit `--password` and a fresh one is minted; omit
+  `--expire`, `--client`/`--label`, or `--public` and the expiry, label, or public
+  tier clears.
+- **No republish keeps recipients logged in.** The verifier re-salts on every
+  publish — same password, different hash — and the login cookie binds that hash,
+  so every live cookie dies either way.
+- **`--slug` is unvalidated**: a typo silently mints a new share at the misspelled
+  URL instead of failing, and a value the Worker won't route (it accepts 2–128
+  characters, starting alphanumeric, otherwise `[a-z0-9._-]`) publishes a share
+  whose own URL 404s. Copy the slug out of `drop list`.
+
+A republish doesn't purge R2 (only `drop revoke` does), but removed files stop
+serving — the Worker gates every request against the current manifest's file
+list. And never fake an update by grafting a temp slug's manifest onto a stable
+one via `/admin/manifest`: R2 keys are derived from the *requested* slug, so the
+graft repoints nothing and the follow-up revoke deletes the bytes.
+
 ---
 
 ## Access: three visibility tiers
@@ -289,6 +320,8 @@ drop/
 │   └── test/worker.test.mjs     # Worker unit tests (node --test style)
 ├── web/
 │   └── index.html               # the public "how it works" page (no external deps)
+├── skills/
+│   └── drop/SKILL.md            # agent skill: how to drive the CLI correctly
 ├── LICENSE                      # MIT
 └── README.md
 ```
@@ -365,6 +398,7 @@ drop --client "Acme" path/to/report            # password, readable slug "acme-�
 drop --unlisted --client "Acme" path/to/report # secret link: no password, unguessable URL
 drop --public path/to/site                     # truly public: no password, guessable URL
 drop --password "$pw" --expire 7d path/to/site # explicit password + 7-day expiry
+drop --slug acme-proposal --password "$pw" ... # republish in place, keeping the same URL
 drop --public --card-title "Q3 Deck" path/site # override the generated link-preview card title
 drop --public --no-card path/to/site           # skip the link-preview card + meta tags
 drop --dry-run path/to/site                    # run preflight + print the manifest, upload nothing
@@ -376,6 +410,28 @@ drop scope-test                                # blast-radius self-check
 
 A successful private share prints the URL and a generated password; send the
 password out-of-band.
+
+---
+
+## Driving it from an AI coding agent
+
+Most of what `drop` publishes is something an agent just generated, so the repo
+ships an **agent skill** at [`skills/drop/SKILL.md`](skills/drop/SKILL.md): the
+tiers, the preflight, the republish verb, and the two traps that bite agents
+hardest — faking an update through `/admin/manifest`, and treating an
+unauthenticated `200` as proof a publish worked (it isn't; auth is checked before
+R2, so a share whose bytes are gone answers 200 at the gate all the same). It
+carries a verification recipe that checks the served sha past the gate.
+
+Install it by pointing your agent's skills directory at the file — for Claude
+Code:
+
+```bash
+mkdir -p ~/.claude/skills && ln -s "$PWD/skills/drop" ~/.claude/skills/drop
+```
+
+It's a plain Markdown file with YAML frontmatter, so any agent runtime that reads
+skills from disk can use it as-is.
 
 ---
 

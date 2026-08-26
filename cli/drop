@@ -1168,7 +1168,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--card-fg", metavar="HEX", help="card title color, e.g. #e8ebf2")
     parser.add_argument("--card-accent", metavar="HEX", help="card accent color, e.g. #7aa2ff")
     parser.add_argument("--no-card", action="store_true", help="do not generate a link-preview card or inject preview meta tags")
-    parser.add_argument("--slug", help=argparse.SUPPRESS)
+    # Republish verb: an exact slug skips the clash resolver, so the bytes land on
+    # that slug's own prefix and the manifest row is upserted in place. Unvalidated
+    # by design (no existence check) — a typo publishes a new share, so copy the
+    # slug out of `drop list` rather than retyping it.
+    parser.add_argument("--slug", metavar="SLUG", help="republish in place at an exact existing slug, keeping the URL (skips the -2/-3 clash suffix)")
     parser.add_argument("--allow-secret", metavar="REASON", help="override gitleaks findings; reason is logged")
     parser.add_argument("--allow-pii", metavar="REASON", help="override high-confidence PII findings; reason is logged")
     parser.add_argument("--confirm-image-limitation", action="store_true", help="accept manual review when OCR is unavailable or fails")
