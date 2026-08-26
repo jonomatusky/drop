@@ -33,7 +33,7 @@ drop --public --no-card path/to/site           # skip the card and the preview m
 drop --dry-run path/to/site                    # preflight + print the manifest, upload nothing
 drop list                                      # every share, with a views=N column
 drop views <slug>                              # who opened it: count + recent timestamps / IPs / UAs
-drop revoke <slug>                             # deny + delete the objects + purge the cache
+drop revoke <slug>                             # deny + delete the objects (cache purge if configured)
 drop scope-test                                # blast-radius self-check on the upload creds
 ```
 
@@ -49,7 +49,10 @@ out-of-band — not in the same message as the link.
 | **Public** | `--public` | none | clean readable `…/demo/` | content meant to be discoverable |
 
 Password-protected is the default: the slug is only a label, the password is the
-lock, so a guessable name leaks nothing. `--unlisted` trades the password for an
+lock, so a guessable name leaks no content. It does leak *existence* — a live
+password share answers with a labeled login page where an unknown slug 404s, so
+don't put anything into a label you wouldn't show a stranger. `--unlisted` trades
+the password for an
 unguessable slug tail — treat that URL as a capability, and don't use the tier
 for anything you'd want truly private. Pair any tier with `--expire 7d` and
 `drop revoke <slug>` for a time-boxed share.
@@ -77,8 +80,12 @@ Every publish is gated by a local scan before a single byte leaves the machine:
 - A **final confirmation** reminds you the artifact is public. `--yes` skips it
   in automation.
 
-`--dry-run` runs the whole preflight and prints the manifest without uploading.
-Use it to see exactly what would ship.
+`--dry-run` runs the whole preflight and prints the manifest without uploading —
+the file list, the per-file digests, and the URL. One gap: it never calls the
+admin API, so it doesn't resolve the clash suffix. An auto-named dry run prints
+`…/report/` while the real publish may land on `…/report-2/`, taking the injected
+og URLs and that page's digest with it. Pass an explicit `--slug` when the
+dry-run output has to match the publish exactly.
 
 ## Slugs and URLs
 
@@ -117,7 +124,10 @@ Four things to know before rerunning it:
   does not spare them the login page.
 - **`--slug` is unvalidated.** No existence check, no format check. A typo
   doesn't fail — it silently mints a new share at the misspelled URL while the
-  real one goes stale. Copy the slug out of `drop list`; don't retype it.
+  real one goes stale. Worse, the Worker only routes a slug of 2–128 characters
+  that starts alphanumeric and is otherwise `[a-z0-9._-]`; a value outside that
+  shape still uploads the objects and writes the row, and then every request to
+  it 404s. Copy the slug out of `drop list`; don't retype it.
 - **`--slug` and `--unlisted` are mutually exclusive.** The CLI refuses the
   combination, because a fixed slug defeats the unguessable tail. To republish an
   existing unlisted share, pass its full secret slug plus `--public`.
@@ -161,10 +171,14 @@ an unknown slug 404s, a revoked or expired share 403s. A destroyed publish looks
 exactly like a healthy one, and its 404 appears only once you're past the gate.
 
 So verify past the gate — and compare against the *published* build, not the file
-on disk. Staging rewrites the entry page before upload: it injects a charset
-declaration and og:/twitter: meta, renames a lone HTML file to `index.html`, and
-adds `og.png` (`stage_publish_set` in `cli/drop`). The served bytes are therefore
-never the bytes you built.
+on disk. Any share containing HTML goes through staging first
+(`stage_publish_set` in `cli/drop`), which on the default path adds og:/twitter:
+meta, renames a lone HTML file to `index.html`, and uploads an extra `og.png` —
+plus a `<meta charset="utf-8">` on any page that declares no encoding. So the
+served entry page is usually **not** byte-identical to the file you built. (The
+exceptions: `--no-card` leaves an already-charset-declaring page untouched, HTML
+that isn't valid UTF-8 is copied through byte-for-byte with a warning, and a
+share with no HTML in it skips staging entirely.)
 
 The post-staging digest is what to assert against, and `--dry-run` prints it —
 the manifest is built from the staged set, so the same flags reproduce the same
@@ -174,13 +188,18 @@ name, so match whichever manifest path the root actually serves:
 
 ```bash
 url=https://drop.example.com/$slug/
+sha256() { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1"; }   # macOS / Linux
 
 expect=$(drop --slug "$slug" --password "$pw" --dry-run --yes build/report.html \
   | python3 -c 'import json,sys; m=json.load(sys.stdin)["manifest"]
 print(next(f["sha256"] for f in m["files"] if f["path"]=="index.html"))')
 
-# Basic auth — the username is ignored, only the password is checked
-got=$(curl -fsS -u "x:$pw" "$url" | shasum -a 256 | cut -d' ' -f1)
+# Basic auth — the username is ignored, only the password is checked.
+# Fetch to a file first: piping curl into the hasher hides curl's exit status,
+# so a transport failure would read as a content mismatch.
+body=$(mktemp)
+curl -fsS -u "x:$pw" "$url" -o "$body" || { echo "fetch failed" >&2; exit 1; }
+got=$(sha256 "$body" | cut -d' ' -f1)
 
 [ "$got" = "$expect" ] || { echo "served content is not this build" >&2; exit 1; }
 ```
@@ -195,7 +214,8 @@ cookie=$(curl -s -i -X POST "$url" --data-urlencode "password=$pw" \
   | sed -n 's/^[Ss]et-[Cc]ookie: \(drop_auth=[^;]*\).*/\1/p')
 [ -n "$cookie" ] || { echo "login failed — no cookie issued" >&2; exit 1; }
 
-got=$(curl -fsS -H "Cookie: $cookie" "$url" | shasum -a 256 | cut -d' ' -f1)
+curl -fsS -H "Cookie: $cookie" "$url" -o "$body" || { echo "fetch failed" >&2; exit 1; }
+got=$(sha256 "$body" | cut -d' ' -f1)
 [ "$got" = "$expect" ] || { echo "served content is not this build" >&2; exit 1; }
 ```
 

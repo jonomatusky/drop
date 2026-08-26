@@ -122,7 +122,9 @@ Three things that bite:
   publish — same password, different hash — and the login cookie binds that hash,
   so every live cookie dies either way.
 - **`--slug` is unvalidated**: a typo silently mints a new share at the misspelled
-  URL instead of failing. Copy the slug out of `drop list`.
+  URL instead of failing, and a value the Worker won't route (it accepts 2–128
+  characters, starting alphanumeric, otherwise `[a-z0-9._-]`) publishes a share
+  whose own URL 404s. Copy the slug out of `drop list`.
 
 A republish doesn't purge R2 (only `drop revoke` does), but removed files stop
 serving — the Worker gates every request against the current manifest's file
