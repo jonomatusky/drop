@@ -54,8 +54,11 @@ password share answers with a labeled login page where an unknown slug 404s, so
 don't put anything into a label you wouldn't show a stranger. `--unlisted` trades
 the password for an
 unguessable slug tail — treat that URL as a capability, and don't use the tier
-for anything you'd want truly private. Pair any tier with `--expire 7d` and
-`drop revoke <slug>` for a time-boxed share.
+for anything you'd want truly private. `--public` means no auth and a guessable
+URL, not indexed: every response carries `x-robots-tag: noindex`, so a search
+engine won't list it either way. Pair any tier with `--expire 7d` and
+`drop revoke <slug>` for a time-boxed share — revoke deletes every object under
+the slug's prefix and does not ask twice, so it's an ending, not a pause.
 
 `--password` on a `--public` or `--unlisted` run is refused rather than silently
 ignored, because a flag that looks like a lock and isn't one is worse than no
@@ -71,12 +74,20 @@ Every publish is gated by a local scan before a single byte leaves the machine:
 - **Dangerous filenames** (dotenv files, `*.pem`, `id_rsa`, credential paths) are
   refused by name.
 - **High-confidence PII** blocks unless overridden with `--allow-pii "<reason>"`.
+  Note the reach: text is read for scanning up to the first 2 MB per file, so
+  content past that mark in a large file is not what the PII and tracker passes
+  looked at. The `gitleaks` pass runs over the files directly and isn't subject
+  to that cap.
 - **Images** are OCR-scanned with `tesseract` when it's available; otherwise you
   must accept the limitation (`--confirm-image-limitation`) after looking at them
   yourself.
 - **Trackers** (external scripts, tracking pixels) warn; **archives** (`.zip`,
   `.tar`, …) are blocked outright; a **symlink** resolving outside the publish
   root is refused.
+- **Keep filenames URL-safe.** The uploader signs the object key straight into
+  the S3 request path without percent-encoding, so a name carrying a space,
+  `#`, `?`, or `%` can fail its `PUT` — mid-directory, after earlier files have
+  already gone up. Rename before publishing rather than finding out halfway.
 - A **final confirmation** reminds you the artifact is public. `--yes` skips it
   in automation.
 
@@ -119,7 +130,9 @@ Four things to know before rerunning it:
   share silently reverts to password-gated.
 - **No republish keeps recipients logged in.** The password verifier takes a
   fresh random salt on every publish — same password, different hash — and the
-  login cookie is a MAC over slug + verifier hash, so every live cookie dies.
+  login cookie is a MAC over slug + verifier hash, so every live cookie stops
+  validating once the new verifier propagates (it lives in KV, which is
+  eventually consistent, so a stale edge can honor the old one briefly).
   Passing the same `--password` preserves the password they already have; it
   does not spare them the login page.
 - **`--slug` is unvalidated.** No existence check, no format check. A typo
@@ -135,6 +148,13 @@ Four things to know before rerunning it:
 A republish does not purge R2; only `drop revoke` does. Rebuilding with fewer
 files leaves the removed objects in the bucket, but they stop serving — the
 Worker gates every request against the current manifest's file list.
+
+One window to know about: the bytes go to R2 **before** the manifest POST, and
+the row keeps its old values until that POST lands. So between the two, the live
+share serves the new bytes under the *old* auth mode and file list. Turning a
+`--public` share into a password-gated one is the case that bites — if the admin
+call fails, the new content sits there publicly readable under the old row.
+Re-run the publish; don't leave a failed republish half-landed.
 
 ## The footgun: never fake an update with `/admin/manifest`
 
@@ -182,32 +202,49 @@ share with no HTML in it skips staging entirely.)
 
 The post-staging digest is what to assert against, and `--dry-run` prints it —
 the manifest is built from the staged set, so the same flags reproduce the same
-sha (pass the same `--slug`; the injected og URLs embed it). The entry is
-`index.html` on the default path — with `--no-card` a lone file keeps its own
-name, so match whichever manifest path the root actually serves:
+sha (pass the same `--slug`; the injected og URLs embed it).
+
+Don't hardcode `index.html` as the entry, though — the root URL resolves three
+ways. The Worker serves `index.html` when the manifest lists one; failing that,
+it falls back to the lone object of a single-file share; failing both, the root
+404s. Staging only renames a **lone** HTML file, so publishing a directory of
+several pages with no `index.html` of its own produces a share whose root URL
+404s while every named page works. The snippet below resolves the entry the same
+way the Worker does, and says so when there isn't one:
 
 ```bash
+set -o pipefail
 url=https://drop.example.com/$slug/
+body=$(mktemp); trap 'rm -f "$body"' EXIT
 sha256() { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1"; }   # macOS / Linux
 
 expect=$(drop --slug "$slug" --password "$pw" --dry-run --yes build/report.html \
-  | python3 -c 'import json,sys; m=json.load(sys.stdin)["manifest"]
-print(next(f["sha256"] for f in m["files"] if f["path"]=="index.html"))')
+  | python3 -c '
+import json, sys
+files = json.load(sys.stdin)["manifest"]["files"]
+by_path = {f["path"]: f["sha256"] for f in files}
+if "index.html" in by_path:
+    print(by_path["index.html"])
+elif len(files) == 1:
+    print(files[0]["sha256"])
+else:
+    sys.exit("no index.html and more than one file — the root URL will 404")
+') || exit 1
 
 # Basic auth — the username is ignored, only the password is checked.
 # Fetch to a file first: piping curl into the hasher hides curl's exit status,
 # so a transport failure would read as a content mismatch.
-body=$(mktemp)
 curl -fsS -u "x:$pw" "$url" -o "$body" || { echo "fetch failed" >&2; exit 1; }
 got=$(sha256 "$body" | cut -d' ' -f1)
 
 [ "$got" = "$expect" ] || { echo "served content is not this build" >&2; exit 1; }
 ```
 
-For the browser path (or to check the cookie itself), POST the login form and
-capture `drop_auth` off the `set-cookie` header. **Fail on an empty cookie before
-you fetch** — a wrong password returns the same 200 gate with no `Set-Cookie`, so
-a `curl -f` carrying an empty cookie sails through it:
+For the browser path (or to check the cookie itself), swap the Basic-auth fetch
+above for a login POST — same `url`, `body`, `expect`, and `sha256` — capturing
+`drop_auth` off the `set-cookie` header. **Fail on an empty cookie before you
+fetch**: a wrong password returns the same 200 gate with no `Set-Cookie`, so a
+`curl -f` carrying an empty cookie sails through it.
 
 ```bash
 cookie=$(curl -s -i -X POST "$url" --data-urlencode "password=$pw" \
@@ -224,6 +261,10 @@ build, and a small report can be smaller than a gate page. If you do want a chea
 smoke check, `curl -w '%{size_download}'` past the gate makes the gap obvious —
 a login gate is a couple of KB where a real report is usually hundreds — but the
 sha is the check.
+
+Verifying costs you a row in the audit trail: an authenticated GET of the
+document is exactly what `view` tracking counts, so a scripted check inflates
+`drop views`. Expect one view per verification run, from your own IP.
 
 Nor does the root URL say anything about the rest of a multi-file share. A
 republish writes each object to R2 before the manifest upsert, with no rollback
@@ -265,3 +306,9 @@ skinny screenshot of a tall page. The card title defaults to the page `<title>`;
 
 These rewrites happen in a temp staging copy. Your source files are never
 modified.
+
+The card only reaches an audience on a no-password share. A crawler fetching a
+password-gated URL gets the login page, which carries none of the staged meta —
+so the injected tags do nothing until someone is past the gate. If a link needs
+to preview well in a chat app, that's an argument for `--unlisted` over the
+password tier.
