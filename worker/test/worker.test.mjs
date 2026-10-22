@@ -419,6 +419,18 @@ assert.equal(constantTimeEqual("same", "diff"), false);
 }
 
 {
+  // The login page must fit a phone. iOS Safari zooms into inputs under 16px on
+  // focus and leaves the page scrolling sideways; 100vh overshoots the visible
+  // area under Safari's toolbars; an unbroken label can push the card wide.
+  const env = await envFor({ s1: row("s1") }, { "auth:s1": JSON.stringify(await verifier("pw")) });
+  const body = await (await fetchHandler(new Request("https://share.example.test/s1/"), env)).text();
+  assert.match(body, /<meta name="viewport" content="width=device-width, initial-scale=1">/);
+  assert.match(body, /@media \(pointer: coarse\) \{\s*input\[type=password\], button \{ font-size: 16px; \}/, "touch inputs are 16px so iOS does not zoom");
+  assert.match(body, /min-height: 100dvh/, "page height tracks the visible viewport");
+  assert.match(body, /h1 \{[^}]*overflow-wrap: anywhere/, "a long unbroken label wraps instead of overflowing");
+}
+
+{
   // Correct password via the login form → 303 redirect with a hardened cookie,
   // and that cookie then grants access to the document (POST→redirect→GET).
   const env = await envFor({ s1: row("s1") }, { "auth:s1": JSON.stringify(await verifier("pw")) });
