@@ -286,10 +286,11 @@ function loginPage(share, { error = false } = {}) {
   @media (pointer: coarse) {
     input[type=password], button { font-size: 16px; }
   }
-  /* Phones. Sit the card near the top so the on-screen keyboard does not
-     cover the field, and give the card more of the narrow width. */
-  @media (max-width: 480px) {
-    body { align-items: flex-start; padding: max(48px, 12vh) 16px 24px; }
+  /* Phones, portrait or landscape. Sit the card near the top so the on-screen
+     keyboard does not cover the field (it shrinks only the visual viewport,
+     not 100dvh), and give the card more of the narrow width. */
+  @media (max-width: 480px), (max-height: 500px) {
+    body { align-items: flex-start; padding: max(16px, 8vh) 16px 16px; }
     .card { padding: 28px 20px; }
   }
   @media (prefers-color-scheme: dark) {
