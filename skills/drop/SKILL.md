@@ -314,6 +314,11 @@ A share published with `--public-preview` adds preview tags to this page, and
 its root `og.png` answers without the password. That is the only
 unauthenticated request that reaches R2, so it proves the card's bytes exist and
 nothing about the rest of the build. Verify the rest past the gate as above.
+The Worker serves that card only while its bytes hash to the sha256 the
+manifest and the stored preview carry. Right after a republish that changes the
+card, KV can lag for about a minute: the unauthenticated `og.png` then gets the
+login page, and the page has no preview tags. That is the check working, not a
+failed publish. Retry after a minute.
 
 ## View tracking
 
@@ -373,6 +378,13 @@ drop --public-preview --card-title "Project proposal" --yes site/
 - The login page then carries the preview tags, and exactly one file loads
   without the password: the generated card at `<slug>/og.png`. Every other path
   still needs the password.
+- **Only the exact card bytes load.** The manifest carries the card's sha256,
+  and the Worker serves `og.png` without the password only while the manifest,
+  the stored preview, and the R2 bytes all agree. A stale preview key or an R2
+  overwrite gets the login page, never new bytes.
+- The card draws only plain ASCII, in at most five lines. With this flag the
+  CLI warns when the title has other characters (they show as `?`) or is too
+  long. Pass an ASCII `--card-title` that fits, so the card matches `og:title`.
 - **What becomes public:** the card title, the description, and the `og.png`
   card. Anyone who knows or guesses the slug sees them, and password slugs are
   readable words. Put nothing secret in the title or description.

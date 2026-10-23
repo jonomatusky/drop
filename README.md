@@ -243,6 +243,15 @@ drop --public-preview --card-title "Project proposal" path/to/site
 - Exactly one file loads without the password: the generated title card at
   `…/<slug>/og.png`. Every other path, including any other image, still needs
   the password.
+- **Only the exact card bytes load.** The manifest carries the card's sha256.
+  The Worker serves `og.png` without the password only while the manifest, the
+  stored preview, and the bytes in R2 all agree on it. Any mismatch gets the
+  plain login page, so a stale preview or a half-done republish can never
+  expose new bytes. Right after a republish that changes the card, the
+  unauthenticated card can show the login page for about a minute.
+- The card draws only plain ASCII, in at most five lines. With this flag the
+  CLI warns when the title has other characters (they show as `?`) or is too
+  long, because then the public card does not match `og:title`.
 - **What becomes public:** the title, the description, and the `og.png` card.
   Anyone who knows or guesses the slug can see them, and password slugs are
   readable words. Keep anything secret out of the title and description.
@@ -542,8 +551,11 @@ only the share's label.
 - By default the login page has no link-preview tags. A share published with
   `--public-preview` adds them, and serves its root `og.png` card without the
   password (see [Previews on a password share](#previews-on-a-password-share---public-preview)).
-  The Worker keeps that opt-in in `AUTH_KV` under `preview:<slug>`. Every
-  publish sets or clears it, and revoke deletes it.
+  The Worker keeps that opt-in in `AUTH_KV` under `preview:<slug>`: the
+  title, the description, and the card's sha256. Every publish sets or clears
+  it, and revoke deletes it. The card loads without the password only while
+  that sha256 matches both the current manifest's `og.png` row and the bytes in
+  R2. The login page carries the tags only while it matches the manifest.
 
 ---
 
