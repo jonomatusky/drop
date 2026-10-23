@@ -124,6 +124,8 @@ drop update acme-proposal-k7f3m9q2x8p4n6tz build/report.html   # unlisted: no pa
   so every live cookie dies either way.
 - **It refuses a share it can't sensibly continue:** an unknown slug, a revoked
   share (revoke is an ending), or an expired one unless you pass `--expire`.
+- **The public preview is not inherited.** Pass `--public-preview` again to keep
+  it; an update without it turns the preview off. The same is true for `--slug`.
 
 `--slug` is the lower-level form. It also skips the clash resolver, but it
 rebuilds the manifest from this run's flags. Omit `--password` and a fresh one is
@@ -225,6 +227,35 @@ drop --public --card-image hero.jpg \
 - The CLI refuses a flag it would ignore: any of these with `--no-card` or on an
   artifact with no HTML page, and
   `--card-bg`/`--card-fg`/`--card-accent` with `--card-image`.
+
+### Previews on a password share: `--public-preview`
+
+A password share gates every path, the card included. So by default a chat app
+gets only the login page, and the link shows bare. `--public-preview` opts one
+share out of that, for the preview only:
+
+```bash
+drop --public-preview --card-title "Project proposal" path/to/site
+```
+
+- The login page carries the share's `og:`/`twitter:` tags: the card title, the
+  description, and the card image.
+- Exactly one file loads without the password: the generated title card at
+  `…/<slug>/og.png`. Every other path, including any other image, still needs
+  the password.
+- **What becomes public:** the title, the description, and the `og.png` card.
+  Anyone who knows or guesses the slug can see them, and password slugs are
+  readable words. Keep anything secret out of the title and description.
+- **It is not inherited.** A republish with `--slug` or `drop update` turns the
+  preview off unless you pass `--public-preview` again.
+- It is off by default. The CLI refuses it with `--public` or `--unlisted`
+  (those tiers already preview), with `--no-card`, and on an artifact with no
+  HTML page.
+- `--card-image` is refused with it. The flag exposes only the generated title
+  card, because a custom image is often a photo. That is a deliberate limit for
+  now.
+- The publish prompt says the preview is public, and the output prints a
+  `preview: public …` line.
 
 The renderer is **pure Python stdlib** — a small `zlib`/`struct` PNG encoder and
 an embedded public-domain 8×8 bitmap font — so it adds no third-party dependency
@@ -448,6 +479,7 @@ drop --slug acme-proposal --password "$pw" ... # republish at an exact slug, set
 drop --public --card-title "Q3 Deck" path/site # override the generated link-preview card title
 drop --public --card-image hero.jpg path/site  # use your own preview image instead of the card
 drop --public --no-card path/to/site           # skip the link-preview card + meta tags
+drop --public-preview path/to/site             # password share whose link preview shows without the password
 drop --dry-run path/to/site                    # run preflight + print the manifest, upload nothing
 drop list                                      # list every share (with a views=N column)
 drop views <slug>                              # who opened it: count + recent timestamps / IPs / UAs
@@ -507,6 +539,11 @@ only the share's label.
   `WWW-Authenticate` challenge — that dialog is exactly what the login page
   replaces.
 - `--public` / `--unlisted` shares have no password and skip the login entirely.
+- By default the login page has no link-preview tags. A share published with
+  `--public-preview` adds them, and serves its root `og.png` card without the
+  password (see [Previews on a password share](#previews-on-a-password-share---public-preview)).
+  The Worker keeps that opt-in in `AUTH_KV` under `preview:<slug>`. Every
+  publish sets or clears it, and revoke deletes it.
 
 ---
 
