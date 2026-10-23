@@ -1436,6 +1436,14 @@ def check_update_target(slug: str, row: dict | None, args: argparse.Namespace) -
         raise PublishError(f"{slug} has an unknown auth_mode {mode!r}; refusing to guess its tier")
 
 
+def check_password_flag(args: argparse.Namespace) -> None:
+    """Refuse an explicitly empty --password, as from an unset shell variable.
+    Treated as absent, it would quietly keep the old password on update, or mint
+    a random one on publish, when the caller meant to set this one."""
+    if args.password is not None and not args.password:
+        raise PublishError("--password is empty; pass a password, or omit --password")
+
+
 def inherited_expiry(row: dict | None, args: argparse.Namespace) -> tuple[str | None, str | None]:
     """The expires_at for a republish onto ``row``, plus a warning or None.
 
@@ -1461,6 +1469,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
     # isn't. (--public/--unlisted are already mutually exclusive via argparse.)
     if (args.public or args.unlisted) and args.password:
         raise PublishError("--password has no effect on --public/--unlisted shares (those tiers have no password); drop one")
+    check_password_flag(args)
     check_card_flags(args)
 
     # Three visibility tiers (YouTube-style):
@@ -1504,6 +1513,7 @@ def cmd_update(slug: str, args: argparse.Namespace) -> None:
     for flag, value in (("--public", args.public), ("--unlisted", args.unlisted), ("--slug", args.slug)):
         if value:
             raise PublishError(f"{flag} has no place in `drop update`: the slug and tier are inherited from the share")
+    check_password_flag(args)
     check_card_flags(args)
 
     token = admin_token()
@@ -1696,13 +1706,15 @@ def explain_keep_refusal(slug: str, err: AdminAPIError) -> None:
         # lookup, or its stored verifier is gone.
         raise PublishError(
             f"the Worker refused to update {slug}: it has no stored password to keep. The share may have "
-            f"been removed or changed since the lookup; check `drop list`, or pass --password to set a new one"
+            f"been removed or changed since the lookup. The new files were already uploaded under {slug}/, "
+            f"so its old record may serve some of them; check `drop list`, or rerun with --password to set a new one"
         ) from err
     if err.body == "missing password_verifier":
         # A Worker from before keep_password_verifier ignores the flag.
         raise PublishError(
-            f"the Worker at {base_url()} cannot keep a stored password; deploy the current worker/, "
-            f"or pass --password to set the password again (recipients will need to log in again)"
+            f"the Worker at {base_url()} cannot keep a stored password, so {slug} was not updated. The new "
+            f"files were already uploaded under {slug}/, so its old record may serve some of them. Deploy the "
+            f"current worker/, or rerun with --password to set the password again (recipients will need to log in again)"
         ) from err
 
 

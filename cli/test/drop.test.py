@@ -427,6 +427,8 @@ def test_update_keep_refused_when_the_stored_password_is_gone():
     assert code == 1, (code, out, err)
     assert "no stored password to keep" in err and "--password" in err, err
     assert "HTTP 400" not in err, err
+    # Upload runs before the manifest, so the refusal must not claim nothing changed.
+    assert "upload" in fake.kinds() and "already uploaded" in err, (fake.events, err)
     assert not fake.manifests and "url:" not in out, (fake.manifests, out)
     assert ("admin", "GET", "/admin/list") not in fake.events[fake.index("upload"):], fake.events  # no purge
 
@@ -454,6 +456,7 @@ def test_update_keep_refused_by_a_worker_without_keep_support():
     code, out, err = run_cli(["update", "acme-proposal", "--yes", str(PAGE)], fake)
     assert code == 1, (code, out, err)
     assert "cannot keep a stored password" in err and "--password" in err, err
+    assert "already uploaded" in err, err
 
 
 def test_update_keep_passes_other_worker_errors_through():
@@ -485,6 +488,14 @@ def test_admin_request_keeps_status_and_body_on_http_error():
         raise AssertionError("admin_request should raise on HTTP 400")
     finally:
         urllib.request.urlopen = saved
+
+
+def test_empty_password_refused():
+    # An unset "$pw" must not quietly keep the old password (update) or mint one (publish).
+    refused(["update", "acme-proposal", "--password", "", "--yes", str(PAGE)],
+            Fake(rows=[row("acme-proposal", auth_mode="password")]), "--password is empty")
+    refused(["--slug", "acme-proposal", "--password", "", "--yes", str(PAGE)], Fake(), "--password is empty")
+    refused(["--password", "", "--yes", str(PAGE)], Fake(), "--password is empty")
 
 
 def test_update_public_share_with_password_refused():
