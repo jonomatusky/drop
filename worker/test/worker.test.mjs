@@ -141,7 +141,10 @@ class DB {
         return { results: Object.values(self.rows) };
       },
       async run() {
-        if (sql.startsWith("UPDATE shares SET revoked_at")) self.revoked.push(this.values[1]);
+        if (sql.startsWith("UPDATE shares SET revoked_at")) {
+          self.revoked.push(this.values[1]);
+          if (self.rows[this.values[1]]) self.rows[this.values[1]].revoked_at = this.values[0];
+        }
         if (sql.includes("INSERT INTO shares")) {
           const [slug, label, auth_mode, sha256, files_json, bytes, scan_result_json, created_at, expires_at, uploader] = this.values;
           self.upserts.push(slug);
@@ -683,8 +686,9 @@ async function viewEnv() {
 //
 // A password share is gated on every path, so a chat app that unfurls the link
 // gets only the login page. With --public-preview the CLI sends `preview`, the
-// Worker stores `preview:<slug>`, the login page carries og:/twitter: tags, and
-// the share-root og.png — and nothing else — loads without the password.
+// Worker writes `scan_result.public_preview` into the D1 manifest row, the login
+// page carries og:/twitter: tags, and the share-root og.png — and nothing else —
+// loads without the password.
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -696,7 +700,11 @@ const PNG_SHA = sha256(PNG_BYTES);
 const OTHER_PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9, 9]);
 const OTHER_SHA = sha256(OTHER_PNG);
 const PREVIEW = { title: "Project proposal", description: "A short summary", image_sha256: PNG_SHA };
+// What upsertManifest stores for PREVIEW: every field, absent ones as null.
+const STORED_PREVIEW = { ...PREVIEW, site_name: null, image_alt: null };
 
+// A password share whose D1 row already carries `preview` as its
+// scan_result.public_preview (or no record with `preview: null`).
 async function previewEnv({ preview = PREVIEW, rowOverrides = {}, kvExtra = {} } = {}) {
   const files = [
     { path: "index.html", sha256: "1".repeat(64) },
@@ -704,18 +712,26 @@ async function previewEnv({ preview = PREVIEW, rowOverrides = {}, kvExtra = {} }
     { path: "hero.png", sha256: "2".repeat(64) },
     { path: "sub/og.png", sha256: "3".repeat(64) },
   ];
+  const scan = preview ? { visibility: "password", public_preview: preview } : { visibility: "password" };
   const env = await envFor(
-    { s1: row("s1", { label: "Acme Proposal", files_json: JSON.stringify(files), ...rowOverrides }) },
     {
-      "auth:s1": JSON.stringify(await verifier("pw")),
-      ...(preview ? { "preview:s1": JSON.stringify(preview) } : {}),
-      ...kvExtra,
+      s1: row("s1", {
+        label: "Acme Proposal",
+        files_json: JSON.stringify(files),
+        scan_result_json: JSON.stringify(scan),
+        ...rowOverrides,
+      }),
     },
+    { "auth:s1": JSON.stringify(await verifier("pw")), ...kvExtra },
   );
   env.ARTIFACTS.objects.set("s1/og.png", PNG_BYTES);
   env.ARTIFACTS.objects.set("s1/hero.png", "HERO");
   env.ARTIFACTS.objects.set("s1/sub/og.png", "SUBCARD");
   return env;
+}
+
+function storedScan(env, slug = "s1") {
+  return JSON.parse(env.DB.rows[slug].scan_result_json);
 }
 
 function get(path, init = {}) {
@@ -725,6 +741,10 @@ function get(path, init = {}) {
 async function isLoginPage(res) {
   const body = await res.text();
   return res.status === 200 && /text\/html/.test(res.headers.get("content-type")) && /name="password"/.test(body);
+}
+
+function hasPreviewTags(page) {
+  return /og:|twitter:/.test(page);
 }
 
 function manifestRequest(payload) {
@@ -743,7 +763,7 @@ async function manifestPayload(overrides = {}) {
     sha256: "abc",
     files: [{ path: "index.html", sha256: "1".repeat(64) }, { path: "og.png", sha256: PNG_SHA }],
     bytes: 2,
-    scan_result: {},
+    scan_result: { visibility: "password" },
     created_at: "2026-06-22T00:00:00+00:00",
     uploader: "test",
     password_verifier: await verifier("pw"),
@@ -764,13 +784,15 @@ async function manifestPayload(overrides = {}) {
 }
 
 {
-  // 2. With a preview: the share-root og.png loads without auth, as the image.
+  // 2. Happy path: the share-root og.png loads without auth, as the exact
+  //    image bytes, with the normal headers, and via HEAD.
   const env = await previewEnv();
   const res = await fetchHandler(get("/s1/og.png"), env);
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("content-type"), "image/png");
-  assert.deepEqual(new Uint8Array(await res.arrayBuffer()), PNG_BYTES);
+  assert.equal(res.headers.get("etag"), '"test"');
   assert.equal(res.headers.get("x-robots-tag"), "noindex", "security headers still apply");
+  assert.deepEqual(new Uint8Array(await res.arrayBuffer()), PNG_BYTES);
   const head = await fetchHandler(get("/s1/og.png", { method: "HEAD" }), env);
   assert.equal(head.status, 200);
   assert.equal(head.headers.get("content-type"), "image/png");
@@ -831,6 +853,8 @@ async function manifestPayload(overrides = {}) {
     assert.match(page, /<meta name="twitter:title" content="Project proposal">/);
     assert.match(page, /<meta name="twitter:description" content="A short summary">/);
     assert.match(page, /<meta name="twitter:image" content="https:\/\/share\.example\.test\/s1\/og\.png">/);
+    // No site name or alt text in this record, so no tags for them.
+    assert.doesNotMatch(page, /og:site_name|image:alt/);
     // The visible page is unchanged: the label heading, the form, no document.
     assert.match(page, /<h1>Acme Proposal<\/h1>/);
     assert.match(page, /name="password"/);
@@ -860,38 +884,126 @@ async function manifestPayload(overrides = {}) {
 }
 
 {
-  // 5. A republish without a preview clears the key, and og.png is gated again.
-  //    A republish with one sets it. The audit row records which.
+  // 4c. Site name and alt text, published through the admin API, come out as
+  //     og:site_name, og:image:alt and twitter:image:alt, HTML-escaped.
+  const env = await previewEnv({ preview: null });
+  const preview = { ...PREVIEW, site_name: `Acme & "Co" <x>`, image_alt: `Card: 'Q3' <plan> & more` };
+  assert.equal((await fetchHandler(manifestRequest(await manifestPayload({ preview })), env)).status, 200);
+  assert.deepEqual(storedScan(env).public_preview, preview);
+  const page = await (await fetchHandler(get("/s1/"), env)).text();
+  assert.match(page, /<meta property="og:site_name" content="Acme &amp; &quot;Co&quot; &lt;x&gt;">/);
+  assert.match(page, /<meta property="og:image:alt" content="Card: &#39;Q3&#39; &lt;plan&gt; &amp; more">/);
+  assert.match(page, /<meta name="twitter:image:alt" content="Card: &#39;Q3&#39; &lt;plan&gt; &amp; more">/);
+  assert.doesNotMatch(page, /<x>|<plan>/, "no raw site name or alt text in the page");
+}
+
+{
+  // 5. The record is set by a publish with a preview and dropped by one without.
+  //    The audit row records which.
   const env = await previewEnv({ preview: null });
   const withPreview = await fetchHandler(manifestRequest(await manifestPayload({ preview: PREVIEW })), env);
   assert.equal(withPreview.status, 200);
-  assert.deepEqual(JSON.parse(env.AUTH_KV.map.get("preview:s1")), PREVIEW);
+  assert.deepEqual(storedScan(env), { visibility: "password", public_preview: STORED_PREVIEW });
   assert.equal((await fetchHandler(get("/s1/og.png"), env)).status, 200);
   assert.equal(JSON.parse(env.DB.audit.at(-1).details_json).preview, true);
 
   const without = await fetchHandler(manifestRequest(await manifestPayload()), env);
   assert.equal(without.status, 200);
-  assert.equal(env.AUTH_KV.map.has("preview:s1"), false, "republish without preview clears the key");
+  assert.deepEqual(storedScan(env), { visibility: "password" }, "republish without preview drops the record");
   assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), env)), "og.png is gated again");
   assert.equal(JSON.parse(env.DB.audit.at(-1).details_json).preview, false);
 
-  // A missing description is stored as null.
+  // Missing optional fields are stored as null.
   await fetchHandler(manifestRequest(await manifestPayload({ preview: { title: "T", image_sha256: PNG_SHA } })), env);
-  assert.deepEqual(JSON.parse(env.AUTH_KV.map.get("preview:s1")), { title: "T", description: null, image_sha256: PNG_SHA });
+  assert.deepEqual(storedScan(env).public_preview, {
+    title: "T",
+    description: null,
+    site_name: null,
+    image_alt: null,
+    image_sha256: PNG_SHA,
+  });
   // Only the known fields are stored.
   await fetchHandler(manifestRequest(await manifestPayload({ preview: { ...PREVIEW, extra: "x" } })), env);
-  assert.deepEqual(Object.keys(JSON.parse(env.AUTH_KV.map.get("preview:s1"))).sort(), ["description", "image_sha256", "title"]);
+  assert.deepEqual(Object.keys(storedScan(env).public_preview).sort(), [
+    "description",
+    "image_alt",
+    "image_sha256",
+    "site_name",
+    "title",
+  ]);
+  // The preview never touches KV.
+  assert.equal(env.AUTH_KV.writes.some(([, key]) => key.startsWith("preview:")), false, "no KV write for the preview");
 }
 
 {
-  // Republishing as a public share also clears a stale key.
+  // 5b. The case a KV-held record got wrong: republish WITHOUT the flag and keep
+  //     the identical card. Every hash still agrees, so only the record itself
+  //     can turn the preview off, and it goes in the same D1 write. A leftover
+  //     `preview:<slug>` KV key (from an older Worker) is ignored.
+  const env = await previewEnv({ preview: null });
+  assert.equal((await fetchHandler(manifestRequest(await manifestPayload({ preview: PREVIEW })), env)).status, 200);
+  assert.equal((await fetchHandler(get("/s1/og.png"), env)).status, 200);
+  assert.equal((await fetchHandler(manifestRequest(await manifestPayload()), env)).status, 200);
+  env.AUTH_KV.map.set("preview:s1", JSON.stringify(PREVIEW));
+  const og = await fetchHandler(get("/s1/og.png"), env);
+  assert.ok(await isLoginPage(og), "same card, no flag: og.png is the login page");
+  const head = await fetchHandler(get("/s1/og.png", { method: "HEAD" }), env);
+  assert.match(head.headers.get("content-type"), /text\/html/, "nor via HEAD");
+  assert.equal(hasPreviewTags(await (await fetchHandler(get("/s1/"), env)).text()), false, "and no og tags");
+}
+
+{
+  // 5c. A client-sent scan_result.public_preview grants nothing: without a valid
+  //     `preview` it is stripped, and with one the server-written record wins.
+  const env = await previewEnv({ preview: null });
+  const smuggled = await manifestPayload({ scan_result: { visibility: "password", public_preview: PREVIEW } });
+  assert.equal((await fetchHandler(manifestRequest(smuggled), env)).status, 200);
+  assert.deepEqual(storedScan(env), { visibility: "password" }, "a client-sent record is stripped");
+  assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), env)), "a client-sent record unlocks nothing");
+  assert.equal(hasPreviewTags(await (await fetchHandler(get("/s1/"), env)).text()), false);
+
+  // `preview: null` is the same as no preview.
+  const nulled = await manifestPayload({ preview: null, scan_result: { public_preview: PREVIEW } });
+  assert.equal((await fetchHandler(manifestRequest(nulled), env)).status, 200);
+  assert.deepEqual(storedScan(env), {});
+
+  const both = await manifestPayload({
+    preview: { title: "Server title", image_sha256: PNG_SHA },
+    scan_result: { public_preview: { title: "Client title", image_sha256: PNG_SHA, site_name: "Client" } },
+  });
+  assert.equal((await fetchHandler(manifestRequest(both), env)).status, 200);
+  assert.equal(storedScan(env).public_preview.title, "Server title");
+  assert.equal(storedScan(env).public_preview.site_name, null);
+
+  // A public share strips a client-sent record too, and serves as usual.
+  const pub = await manifestPayload({
+    auth_mode: "public",
+    password_verifier: undefined,
+    scan_result: { visibility: "public", public_preview: PREVIEW },
+  });
+  assert.equal((await fetchHandler(manifestRequest(pub), env)).status, 200);
+  assert.deepEqual(storedScan(env), { visibility: "public" });
+}
+
+{
+  // Republishing as a public share drops the record.
   const env = await previewEnv();
   const res = await fetchHandler(
     manifestRequest(await manifestPayload({ auth_mode: "public", password_verifier: undefined })),
     env,
   );
   assert.equal(res.status, 200);
-  assert.equal(env.AUTH_KV.map.has("preview:s1"), false);
+  assert.equal("public_preview" in storedScan(env), false);
+}
+
+{
+  // /admin/list still works and returns the stored record inside scan_result.
+  const env = await previewEnv({ preview: null });
+  assert.equal((await fetchHandler(manifestRequest(await manifestPayload({ preview: PREVIEW })), env)).status, 200);
+  const res = await fetchHandler(get("/admin/list", { headers: { authorization: "Bearer admin" } }), env);
+  assert.equal(res.status, 200);
+  const s1 = (await res.json()).shares.find((share) => share.slug === "s1");
+  assert.deepEqual(s1.scan_result.public_preview, STORED_PREVIEW);
 }
 
 {
@@ -909,7 +1021,16 @@ async function manifestPayload(overrides = {}) {
     [{ preview: t({ title: "\u{1F600}".repeat(151) }) }, /title/],
     [{ preview: t({ description: 7 }) }, /description/],
     [{ preview: t({ description: "x".repeat(1001) }) }, /description/],
+    [{ preview: t({ site_name: 7 }) }, /site_name/],
+    [{ preview: t({ site_name: ["x"] }) }, /site_name/],
+    [{ preview: t({ site_name: "x".repeat(301) }) }, /site_name/],
+    [{ preview: t({ site_name: "\u{1F600}".repeat(151) }) }, /site_name/],
+    [{ preview: t({ image_alt: false }) }, /image_alt/],
+    [{ preview: t({ image_alt: "x".repeat(301) }) }, /image_alt/],
+    [{ preview: t({ image_alt: "\u{1F600}".repeat(151) }) }, /image_alt/],
     [{ preview: "Project proposal" }, /object/],
+    [{ preview: PREVIEW, scan_result: "clean" }, /scan_result/],
+    [{ preview: PREVIEW, scan_result: [] }, /scan_result/],
     [{ preview: PREVIEW, files: [{ path: "index.html" }] }, /og\.png/],
     [{ preview: PREVIEW, files: [{ path: "index.html" }, { path: "sub/og.png", sha256: PNG_SHA }] }, /og\.png/],
     // The card hash: present, 64 lowercase hex, and equal to the og.png row.
@@ -934,14 +1055,13 @@ async function manifestPayload(overrides = {}) {
     assert.equal(env.DB.audit.length, 0, "a rejected manifest writes no audit row");
   }
   // At the limits is fine (300 UTF-16 units, 150 emoji included).
-  for (const title of ["x".repeat(300), "\u{1F600}".repeat(150)]) {
+  for (const text of ["x".repeat(300), "\u{1F600}".repeat(150)]) {
     const env = await previewEnv({ preview: null });
-    const ok = await fetchHandler(
-      manifestRequest(await manifestPayload({ preview: { title, description: "y".repeat(1000), image_sha256: PNG_SHA } })),
-      env,
-    );
+    const preview = { title: text, description: "y".repeat(1000), site_name: text, image_alt: text, image_sha256: PNG_SHA };
+    const ok = await fetchHandler(manifestRequest(await manifestPayload({ preview })), env);
     assert.equal(ok.status, 200);
     assert.deepEqual(env.DB.upserts, ["s1"]);
+    assert.deepEqual(storedScan(env).public_preview, preview);
   }
 }
 
@@ -978,8 +1098,11 @@ async function manifestPayload(overrides = {}) {
 }
 
 {
-  // 9. Revoke deletes the preview key.
+  // 9. Revoke: og.png is 403 revoked afterwards. The D1 row's revoked_at alone
+  //    is enough, so a deny key that has not reached this edge yet does not
+  //    reopen the card.
   const env = await previewEnv();
+  assert.equal((await fetchHandler(get("/s1/og.png"), env)).status, 200);
   const res = await fetchHandler(
     get("/admin/revoke", {
       method: "POST",
@@ -989,12 +1112,19 @@ async function manifestPayload(overrides = {}) {
     env,
   );
   assert.equal(res.status, 200);
-  assert.equal(env.AUTH_KV.map.has("preview:s1"), false, "revoke deletes preview:<slug>");
+  const after = await fetchHandler(get("/s1/og.png"), env);
+  assert.equal(after.status, 403);
+  assert.match(await after.text(), /revoked/);
+  env.AUTH_KV.map.delete("deny:s1");
+  const staleDeny = await fetchHandler(get("/s1/og.png"), env);
+  assert.equal(staleDeny.status, 403, "revoked_at in D1 refuses the card without the deny key");
+  assert.match(await staleDeny.text(), /revoked/);
+  assert.equal(env.AUTH_KV.writes.some(([, key]) => key.startsWith("preview:")), false, "revoke writes no preview key");
 }
 
 {
-  // The preview key is read lazily: a cookie- or Basic-authenticated request
-  // never reads it, whatever the path.
+  // No request reads a `preview:` KV key any more, and cookie- or
+  // Basic-authenticated requests serve every path as usual.
   const v1 = await verifier("pw");
   const env = await previewEnv();
   env.AUTH_KV.map.set("auth:s1", JSON.stringify(v1));
@@ -1010,16 +1140,19 @@ async function manifestPayload(overrides = {}) {
     assert.equal(res.status, 200, path);
     const viaBasic = await fetchHandler(get(path, { headers: { authorization: auth } }), env);
     assert.equal(viaBasic.status, 200, path);
+    await fetchHandler(get(path), env);
   }
-  assert.equal(reads.includes("preview:s1"), false, "authenticated requests never read the preview key");
+  assert.equal(reads.some((key) => key.startsWith("preview:")), false, "no request reads a preview KV key");
   // A logged-in viewer still gets the real og.png.
   const og = await fetchHandler(get("/s1/og.png", { headers: { cookie } }), env);
   assert.deepEqual(new Uint8Array(await og.arrayBuffer()), PNG_BYTES);
 }
 
 {
-  // Public shares are unchanged by a (stray) preview key: everything serves.
-  const env = await envFor({ public: row("public", { auth_mode: "public" }) }, { "preview:public": JSON.stringify(PREVIEW) });
+  // Public shares are unchanged by a (stray) record: everything serves.
+  const env = await envFor({
+    public: row("public", { auth_mode: "public", scan_result_json: JSON.stringify({ public_preview: PREVIEW }) }),
+  });
   const res = await fetchHandler(get("/public/"), env);
   assert.equal(res.status, 200);
   assert.equal(await res.text(), "<h1>ok</h1>");
@@ -1027,69 +1160,53 @@ async function manifestPayload(overrides = {}) {
 
 // --- the preview is bound to exact card bytes --------------------------------
 //
-// KV reads can be stale for a while after a write, and the CLI uploads to R2
-// before it posts the manifest. So the key and the R2 object can each run ahead
-// of, or behind, the D1 manifest. These cases fail on a path-only exemption.
-
-function hasPreviewTags(page) {
-  return /og:|twitter:/.test(page);
-}
+// The CLI uploads to R2 before it posts the manifest, so the R2 object can run
+// ahead of the D1 manifest. And the record must name the card its own manifest
+// lists. These cases fail on a path-only exemption.
 
 {
-  // Stale KV after an opt-out: the new manifest has a different og.png (here
-  // the artifact's own, as with --no-card) and no preview, but this edge still
-  // reads the old key. The new og.png must not load, and the login page must
-  // carry no preview tags.
+  // A record whose image_sha256 does not match the manifest's og.png row (here
+  // the row names another card) counts as no preview: the og.png does not load,
+  // and the login page carries no preview tags.
   const env = await previewEnv({
     rowOverrides: { files_json: JSON.stringify([{ path: "index.html", sha256: "1".repeat(64) }, { path: "og.png", sha256: OTHER_SHA }]) },
   });
   env.ARTIFACTS.objects.set("s1/og.png", OTHER_PNG);
   const og = await fetchHandler(get("/s1/og.png"), env);
-  assert.ok(await isLoginPage(og), "a stale key does not unlock the new manifest's og.png");
+  assert.ok(await isLoginPage(og), "a mismatched record does not unlock the manifest's og.png");
   const page = await (await fetchHandler(get("/s1/"), env)).text();
-  assert.equal(hasPreviewTags(page), false, "a stale key does not decorate the login page");
+  assert.equal(hasPreviewTags(page), false, "a mismatched record does not decorate the login page");
   const head = await fetchHandler(get("/s1/og.png", { method: "HEAD" }), env);
   assert.notEqual(head.headers.get("content-type"), "image/png", "nor via HEAD");
 }
 
 {
-  // The same race driven through the admin API: publish with a preview, then
-  // republish without one while this edge's KV still returns the old key.
-  const env = await previewEnv({ preview: null });
-  assert.equal((await fetchHandler(manifestRequest(await manifestPayload({ preview: PREVIEW })), env)).status, 200);
-  assert.equal((await fetchHandler(get("/s1/og.png"), env)).status, 200);
-  const staleKey = env.AUTH_KV.map.get("preview:s1");
-  env.ARTIFACTS.objects.set("s1/og.png", OTHER_PNG);
-  const republish = await manifestPayload({
-    files: [{ path: "index.html", sha256: "1".repeat(64) }, { path: "og.png", sha256: OTHER_SHA }],
-  });
-  assert.equal((await fetchHandler(manifestRequest(republish), env)).status, 200);
-  assert.equal(env.AUTH_KV.map.has("preview:s1"), false);
-  env.AUTH_KV.map.set("preview:s1", staleKey); // a stale read on another edge
-  assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), env)), "stale key + new manifest: login page");
-  assert.equal(hasPreviewTags(await (await fetchHandler(get("/s1/"), env)).text()), false);
-}
-
-{
-  // Stale KV where the new manifest has no og.png at all.
+  // A record where the manifest has no og.png at all.
   const env = await previewEnv({ rowOverrides: { files_json: JSON.stringify([{ path: "index.html", sha256: "1".repeat(64) }]) } });
   assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), env)));
   assert.equal(hasPreviewTags(await (await fetchHandler(get("/s1/"), env)).text()), false);
 }
 
 {
-  // A key with no image_sha256 (written before this binding) or a manifest row
-  // with no sha256 counts as no preview.
-  const legacy = await previewEnv({ preview: { title: "Project proposal", description: null } });
-  assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), legacy)));
-  assert.equal(hasPreviewTags(await (await fetchHandler(get("/s1/"), legacy)).text()), false);
+  // A record with no image_sha256, a malformed record, or a manifest row with
+  // no sha256 counts as no preview.
+  for (const preview of [{ title: "Project proposal", description: null }, "Project proposal", { image_sha256: PNG_SHA }]) {
+    const env = await previewEnv({ preview });
+    assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), env)), JSON.stringify(preview));
+    assert.equal(hasPreviewTags(await (await fetchHandler(get("/s1/"), env)).text()), false);
+  }
   const noRowSha = await previewEnv({ rowOverrides: { files_json: JSON.stringify([{ path: "index.html" }, { path: "og.png" }]) } });
   assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), noRowSha)));
   assert.equal(hasPreviewTags(await (await fetchHandler(get("/s1/"), noRowSha)).text()), false);
+  // A scan_result that is not an object reads as no preview, without throwing.
+  for (const scan of ["null", '"clean"', "[]"]) {
+    const env = await previewEnv({ rowOverrides: { scan_result_json: scan } });
+    assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), env)), scan);
+  }
 }
 
 {
-  // R2 overwrite: the manifest and the key agree, but the CLI has already
+  // R2 overwrite: the manifest and its record agree, but the CLI has already
   // uploaded new og.png bytes (a republish whose manifest has not landed, or
   // failed). Those bytes must not load without the password.
   const env = await previewEnv();
@@ -1099,7 +1216,7 @@ function hasPreviewTags(page) {
   const head = await fetchHandler(get("/s1/og.png", { method: "HEAD" }), env);
   assert.equal(head.status, 200);
   assert.match(head.headers.get("content-type"), /text\/html/, "HEAD gets the login page too");
-  // The login page itself still carries the tags: the manifest and key agree.
+  // The login page itself still carries the tags: the manifest and record agree.
   assert.equal(hasPreviewTags(await (await fetchHandler(get("/s1/"), env)).text()), true);
   // A missing object is the login page as well, not a 404 that says otherwise.
   env.ARTIFACTS.objects.delete("s1/og.png");
@@ -1111,21 +1228,6 @@ function hasPreviewTags(page) {
 }
 
 {
-  // Happy path: exact bytes, normal headers, and HEAD.
-  const env = await previewEnv();
-  const res = await fetchHandler(get("/s1/og.png"), env);
-  assert.equal(res.status, 200);
-  assert.equal(res.headers.get("content-type"), "image/png");
-  assert.equal(res.headers.get("etag"), '"test"');
-  assert.equal(res.headers.get("x-robots-tag"), "noindex");
-  assert.deepEqual(new Uint8Array(await res.arrayBuffer()), PNG_BYTES);
-  const head = await fetchHandler(get("/s1/og.png", { method: "HEAD" }), env);
-  assert.equal(head.status, 200);
-  assert.equal(head.headers.get("content-type"), "image/png");
-  assert.equal(head.body, null);
-}
-
-{
   // Size cap: an object over 2 MB is refused before it is buffered, even when
   // its reported hash would match.
   const env = await previewEnv();
@@ -1133,7 +1235,7 @@ function hasPreviewTags(page) {
   assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), env)), "an oversized card gets the login page");
   assert.equal(env.ARTIFACTS.buffered, 0, "an oversized card is never buffered");
 
-  // A real over-cap object whose hash the manifest and key both carry.
+  // A real over-cap object whose hash the manifest and record both carry.
   const big = new Uint8Array(2 * 1024 * 1024 + 1);
   const bigSha = sha256(big);
   const bigEnv = await previewEnv({

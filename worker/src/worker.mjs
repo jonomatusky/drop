@@ -240,29 +240,33 @@ function escapeHtml(value) {
 
 // --- public link preview for password shares (--public-preview) -------------
 // A password share normally reveals nothing without the password, so chat apps
-// show a bare link. A share published with --public-preview stores
-// `preview:<slug>` = {title, description, image_sha256} in AUTH_KV. Then the
-// login page carries og:/twitter: tags, and exactly one object is served
-// without the password: the generated title card at `<slug>/og.png`. Nothing
-// else is exempt.
+// show a bare link. A share published with --public-preview carries a
+// server-written record in its D1 manifest row:
+// `scan_result.public_preview` = {title, description, site_name, image_alt,
+// image_sha256}. Then the login page carries og:/twitter: tags, and exactly one
+// object is served without the password: the generated title card at
+// `<slug>/og.png`. Nothing else is exempt.
 //
-// The entitlement is bound to exact bytes, not to the path. KV reads can be
-// stale for a while after a republish, and the CLI uploads to R2 before it
-// writes the manifest, so neither the key nor the R2 object alone can be
-// trusted. The card is served only while all three agree: the key's
-// image_sha256, the CURRENT D1 manifest's og.png row sha256, and the sha256 of
-// the bytes read from R2. Any mismatch is the plain login page. So a stale key
-// or an overwritten object can at most serve the card the owner approved.
+// The record lives in D1, not KV, so it is written atomically with the manifest
+// it belongs to and read with it on every request (readShare). A republish
+// without the flag drops it in the same write; a revoke marks the same row.
+// upsertManifest writes the field only from a validated `preview` and strips any
+// client-sent copy, so a client cannot set it directly.
+//
+// The entitlement is bound to exact bytes, not to the path. The CLI uploads to
+// R2 before it writes the manifest, so the R2 object alone cannot be trusted.
+// The card is served only while all three agree: the record's image_sha256, the
+// same manifest's og.png row sha256, and the sha256 of the bytes read from R2.
+// Any mismatch is the plain login page. So an overwritten object can at most
+// serve the card the owner approved.
 const PREVIEW_IMAGE_PATH = "og.png";
 const PREVIEW_TITLE_MAX = 300;
 const PREVIEW_DESCRIPTION_MAX = 1000;
+const PREVIEW_SITE_NAME_MAX = 300;
+const PREVIEW_IMAGE_ALT_MAX = 300;
 // The generated card is a few KB to a few tens of KB. Refuse to buffer more.
 const PREVIEW_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
-
-function previewKey(slug) {
-  return `preview:${slug}`;
-}
 
 // The sha256 the manifest lists for its share-root og.png, or null.
 function manifestCardSha(files) {
@@ -270,11 +274,12 @@ function manifestCardSha(files) {
   return row && typeof row.sha256 === "string" && SHA256_HEX.test(row.sha256) ? row.sha256 : null;
 }
 
-// The stored preview, but only when it names the card the CURRENT manifest
-// lists. A stale key (after an opt-out, or a republish with a new card) whose
-// image_sha256 no longer matches counts as no preview at all.
-async function readPreview(env, share) {
-  const preview = await env.AUTH_KV.get(previewKey(share.slug), { type: "json" });
+// The manifest's preview record, but only when it names the card the same
+// manifest lists. A record whose image_sha256 does not match counts as no
+// preview at all.
+function readPreview(share) {
+  const scan = share.scan_result;
+  const preview = scan && typeof scan === "object" ? scan.public_preview : null;
   if (!preview || typeof preview !== "object" || typeof preview.title !== "string") return null;
   const cardSha = manifestCardSha(share.files);
   if (!cardSha || preview.image_sha256 !== cardSha) return null;
@@ -314,21 +319,28 @@ function previewMeta(slug, preview, origin) {
   const imageUrl = escapeHtml(`${origin}/${slug}/${PREVIEW_IMAGE_PATH}`);
   const title = escapeHtml(preview.title);
   const description = preview.description ? escapeHtml(preview.description) : null;
+  const siteName = preview.site_name ? escapeHtml(preview.site_name) : null;
+  const imageAlt = preview.image_alt ? escapeHtml(preview.image_alt) : null;
   const tags = [
     '<meta property="og:type" content="website">',
     `<meta property="og:title" content="${title}">`,
   ];
   if (description) tags.push(`<meta property="og:description" content="${description}">`);
+  if (siteName) tags.push(`<meta property="og:site_name" content="${siteName}">`);
   tags.push(
     `<meta property="og:url" content="${pageUrl}">`,
     `<meta property="og:image" content="${imageUrl}">`,
     '<meta property="og:image:width" content="1200">',
     '<meta property="og:image:height" content="630">',
+  );
+  if (imageAlt) tags.push(`<meta property="og:image:alt" content="${imageAlt}">`);
+  tags.push(
     '<meta name="twitter:card" content="summary_large_image">',
     `<meta name="twitter:title" content="${title}">`,
   );
   if (description) tags.push(`<meta name="twitter:description" content="${description}">`);
   tags.push(`<meta name="twitter:image" content="${imageUrl}">`);
+  if (imageAlt) tags.push(`<meta name="twitter:image:alt" content="${imageAlt}">`);
   return tags.join("\n");
 }
 
@@ -340,10 +352,18 @@ function validatePreview(payload) {
   if (typeof preview !== "object" || Array.isArray(preview)) return "preview must be an object";
   if (typeof preview.title !== "string" || !preview.title.trim()) return "preview.title must be a non-empty string";
   if (preview.title.length > PREVIEW_TITLE_MAX) return `preview.title is over ${PREVIEW_TITLE_MAX} characters`;
-  const description = preview.description;
-  if (description !== undefined && description !== null) {
-    if (typeof description !== "string") return "preview.description must be a string or null";
-    if (description.length > PREVIEW_DESCRIPTION_MAX) return `preview.description is over ${PREVIEW_DESCRIPTION_MAX} characters`;
+  for (const [field, max] of [
+    ["description", PREVIEW_DESCRIPTION_MAX],
+    ["site_name", PREVIEW_SITE_NAME_MAX],
+    ["image_alt", PREVIEW_IMAGE_ALT_MAX],
+  ]) {
+    const value = preview[field];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== "string") return `preview.${field} must be a string or null`;
+    if (value.length > max) return `preview.${field} is over ${max} characters`;
+  }
+  if (!payload.scan_result || typeof payload.scan_result !== "object" || Array.isArray(payload.scan_result)) {
+    return "preview needs scan_result to be an object";
   }
   const cardRow = payload.files.find((file) => file && file.path === PREVIEW_IMAGE_PATH);
   if (!cardRow) return `preview needs ${PREVIEW_IMAGE_PATH} in files`;
@@ -353,18 +373,25 @@ function validatePreview(payload) {
   return null;
 }
 
-// Every publish rewrites the key: set with a preview, cleared without one, so a
-// republish that leaves out --public-preview turns the preview off.
-async function storePreview(env, payload) {
-  if (payload.preview) {
-    const { title, description, image_sha256 } = payload.preview;
-    await env.AUTH_KV.put(
-      previewKey(payload.slug),
-      JSON.stringify({ title, description: description || null, image_sha256 }),
-    );
-  } else {
-    await env.AUTH_KV.delete(previewKey(payload.slug));
-  }
+// The scan_result to store: with `scan_result.public_preview` set from a
+// validated `preview`, or with any client-sent `public_preview` removed. Every
+// publish rewrites the row, so a republish that leaves out --public-preview
+// turns the preview off in the same write.
+function withPublicPreview(scanResult, preview) {
+  if (!scanResult || typeof scanResult !== "object" || Array.isArray(scanResult)) return scanResult;
+  const { public_preview: _clientSent, ...rest } = scanResult;
+  if (!preview) return rest;
+  const { title, description, site_name, image_alt, image_sha256 } = preview;
+  return {
+    ...rest,
+    public_preview: {
+      title,
+      description: description || null,
+      site_name: site_name || null,
+      image_alt: image_alt || null,
+      image_sha256,
+    },
+  };
 }
 // --- end public link preview -------------------------------------------------
 
@@ -551,16 +578,17 @@ async function requireShareAuth(env, request, share, path) {
       return { ok: false, response: loginRedirect(request, slug, token) };
     }
     if (!(await enforceRateLimit(env, request, slug))) return { ok: false, response: rateLimited() };
-    const preview = await readPreview(env, share);
+    const preview = readPreview(share);
     return { ok: false, response: loginPage(share, { error: true, preview, origin: new URL(request.url).origin }) };
   }
 
   // 4) Unauthenticated browser request → serve the clean HTML login page. The
-  //    preview key is read only here and in the failed POST above, never on a
-  //    cookie- or Basic-authenticated request. With a preview that matches the
-  //    current manifest, the share-root og.png is the one object served without
-  //    the password, and serveArtifact still checks its bytes (previewSha256).
-  const preview = await readPreview(env, share);
+  //    preview record is read only here and in the failed POST above, never on
+  //    a cookie- or Basic-authenticated request. With a preview that matches
+  //    the current manifest, the share-root og.png is the one object served
+  //    without the password, and serveArtifact still checks its bytes
+  //    (previewSha256).
+  const preview = readPreview(share);
   if (preview && isPreviewImageRequest(request, share, path)) {
     return { ok: true, previewSha256: preview.image_sha256 };
   }
@@ -625,7 +653,7 @@ async function serveArtifact(request, env, url, ctx) {
   if (!object) return previewImage ? loginPage(share) : notFound();
   let body = object.body;
   if (previewImage) {
-    // The R2 bytes must be the exact card the manifest and the key approved.
+    // The R2 bytes must be the exact card the manifest approved.
     body = await approvedCardBytes(object, auth.previewSha256);
     if (!body) return loginPage(share);
   }
@@ -707,6 +735,9 @@ async function upsertManifest(request, env) {
   const previewError = validatePreview(payload);
   if (previewError) return badRequest(previewError);
   // --- end public link preview ---
+  // --- public link preview: set or strip scan_result.public_preview (see withPublicPreview) ---
+  payload.scan_result = withPublicPreview(payload.scan_result, payload.preview);
+  // --- end public link preview ---
 
   await env.DB.prepare(
     `INSERT INTO shares (slug, label, auth_mode, sha256, files_json, bytes, scan_result_json, created_at, expires_at, revoked_at, uploader)
@@ -740,9 +771,6 @@ async function upsertManifest(request, env) {
     await env.AUTH_KV.delete(`auth:${payload.slug}`);
   }
   await env.AUTH_KV.delete(`deny:${payload.slug}`);
-  // --- public link preview: store or clear (see storePreview) ---
-  await storePreview(env, payload);
-  // --- end public link preview ---
   await recordAudit(env, payload.slug, "publish", payload.uploader, {
     auth_mode: payload.auth_mode,
     bytes: payload.bytes,
@@ -777,7 +805,6 @@ async function revokeShare(request, env) {
   if (!share) return notFound();
 
   await env.AUTH_KV.put(`deny:${slug}`, "1");
-  await env.AUTH_KV.delete(previewKey(slug));
   await env.DB.prepare("UPDATE shares SET revoked_at = ? WHERE slug = ?").bind(new Date().toISOString(), slug).run();
 
   const deleted = [];
