@@ -51,6 +51,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import zlib
 from pathlib import Path
 
@@ -85,6 +86,19 @@ EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECAS
 SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 CREDENTIAL_RE = re.compile(r"\b(password|passwd|pwd|api[_-]?key|secret|token)\b\s*[:=]\s*['\"]?[^'\"\s]{8,}", re.IGNORECASE)
 URL_ATTRS = {"src", "href", "poster", "data", "action"}
+
+# Image formats accepted by --card-image, with the og:image:type each declares.
+# Named here rather than read from mimetypes, whose table varies by platform
+# (older Pythons have no entry for .webp at all).
+CARD_IMAGE_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+# Same reason: without this, a .webp would upload as application/octet-stream.
+mimetypes.add_type("image/webp", ".webp")
 
 
 class PublishError(Exception):
@@ -202,6 +216,28 @@ def generated_slug(readable_source: str | None, *, secret: bool = False) -> str:
         tail = "".join(secrets.choice(SLUG_ALPHABET) for _ in range(SECRET_SLUG_LEN))
         return f"{base}-{tail}"
     return base
+
+
+def looks_unlisted(slug: str) -> bool:
+    """True if a slug carries the unguessable tail that ``generated_slug(secret=
+    True)`` mints: a readable base, a hyphen, then exactly SECRET_SLUG_LEN chars
+    from SLUG_ALPHABET.
+
+    The tail must also contain at least one digit. A public slug can end in a
+    16-letter word (``…-characterization``) that is otherwise the same shape as a
+    tail, and calling it unlisted would bless a guessable URL as a secret one. A
+    random base36 tail is all letters only (26/36)^16 ≈ 0.55% of the time, so the
+    rule turns away about one real unlisted slug in 180. That owner still has
+    ``drop update <slug>``, which keeps the slug and the no-password tier without
+    needing this check."""
+    base, sep, tail = slug.rpartition("-")
+    if not sep or not base:
+        return False
+    return (
+        len(tail) == SECRET_SLUG_LEN
+        and all(c in SLUG_ALPHABET for c in tail)
+        and any(c.isdigit() for c in tail)
+    )
 
 
 def iter_files(path: Path) -> list[tuple[Path, str]]:
@@ -355,6 +391,10 @@ def public_confirm(args: argparse.Namespace) -> None:
 
 
 def preflight(path: Path, files: list[tuple[Path, str]], args: argparse.Namespace) -> dict:
+    """Scan everything that will be published. ``files`` is the artifact's own
+    files plus any file staged in from outside it (an external --card-image), so
+    the filename, PII, and OCR passes cover both. gitleaks scans ``path`` only —
+    the artifact root — which is all it can point at."""
     blocks: list[str] = []
     warnings: list[str] = []
     override_log: list[dict] = []
@@ -578,6 +618,106 @@ def upload_r2(files: list[tuple[Path, str]], slug: str) -> None:
             raise PublishError(f"R2 upload failed for {rel}: HTTP {status}: {response.decode(errors='ignore')[:200]}")
 
 
+# --- Stale-object purge after a republish -----------------------------------
+#
+# A republish uploads the new build over `<slug>/` but nothing removes the files
+# the new build dropped. The Worker already refuses to serve them (it gates on
+# the manifest's file list), but they sit in the bucket for good, and a later
+# republish that reuses one of those names would be the only thing to replace
+# them. So after the manifest lands, list the prefix and delete what the new
+# file set no longer names.
+
+
+def s3_query(params: dict[str, str]) -> str:
+    """A SigV4 canonical query string. s3_request signs the query verbatim and
+    sends the same text, so it has to be canonical already: names sorted, names
+    and values URI-encoded with only the unreserved set left bare (a `/` in a
+    prefix becomes %2F)."""
+    def enc(value: str) -> str:
+        return urllib.parse.quote(value, safe="-_.~")
+
+    return "&".join(f"{enc(name)}={enc(params[name])}" for name in sorted(params))
+
+
+def parse_list_objects(body: bytes) -> tuple[list[str], str | None]:
+    """Parse one ListObjectsV2 page into (keys, next continuation token or None).
+
+    Namespace-aware: S3 puts every element in the 2006-03-01 namespace, and a
+    plain ``find("Contents")`` would match nothing. The namespace is read off the
+    root rather than hardcoded, so an un-namespaced reply parses too."""
+    root = ET.fromstring(body)
+    ns = root.tag[1:].partition("}")[0] if root.tag.startswith("{") else ""
+
+    def q(name: str) -> str:
+        return f"{{{ns}}}{name}" if ns else name
+
+    keys = [el.text for el in root.findall(f"{q('Contents')}/{q('Key')}") if el.text]
+    truncated = (root.findtext(q("IsTruncated")) or "").strip().lower() == "true"
+    if not truncated:
+        return keys, None
+    token = (root.findtext(q("NextContinuationToken")) or "").strip()
+    if not token:
+        raise PublishError("R2 listing was truncated but carried no continuation token")
+    return keys, token
+
+
+def list_r2_keys(bucket: str, prefix: str) -> list[str]:
+    """Every object key under ``prefix``, following ListObjectsV2 pagination."""
+    keys: list[str] = []
+    token: str | None = None
+    while True:
+        params = {"list-type": "2", "prefix": prefix}
+        if token:
+            params["continuation-token"] = token
+        status, body = s3_request("GET", bucket, query=s3_query(params))
+        if status != 200:
+            raise PublishError(f"R2 list of {prefix} failed: HTTP {status}: {body.decode(errors='ignore')[:200]}")
+        page, token = parse_list_objects(body)
+        keys.extend(page)
+        if token is None:
+            return keys
+
+
+def stale_keys(keys: list[str], slug: str, keep_rels: set[str]) -> list[str]:
+    """The keys under ``<slug>/`` whose rel path is not in the new file set.
+
+    Pure, so it is testable without a bucket. Only keys under this exact prefix
+    can come back; a sibling share such as ``<slug>-2/`` shares the leading
+    characters but not the trailing slash, so it never matches."""
+    prefix = f"{slug}/"
+    return [key for key in keys if key.startswith(prefix) and key[len(prefix):] not in keep_rels]
+
+
+def purge_stale_objects(slug: str, keep_rels: set[str]) -> tuple[int, str | None]:
+    """Delete objects under ``<slug>/`` that the just-published manifest no
+    longer names. Returns (deleted count, warning or None) and never raises: it
+    runs after the manifest POST, so the share is already live with the new
+    build, and a cleanup failure must not read as a failed publish."""
+    bucket = os.environ.get("DROP_R2_BUCKET", DEFAULT_BUCKET)
+    prefix = f"{slug}/"
+    deleted = 0
+    failed: list[str] = []
+    try:
+        for key in stale_keys(list_r2_keys(bucket, prefix), slug, keep_rels):
+            # stale_keys already filters to the prefix; this re-check is the one
+            # line that stands between a bug and deleting another share's bytes.
+            if not key.startswith(prefix):
+                raise PublishError(f"refusing to delete {key!r}: outside {prefix}")
+            # s3_request puts the key into both the signed URI and the URL as
+            # given, so hand it the encoded form.
+            status, _ = s3_request("DELETE", bucket, urllib.parse.quote(key, safe="/-_.~"))
+            if 200 <= status < 300:
+                deleted += 1
+            else:
+                failed.append(f"{key} (HTTP {status})")
+    except Exception as err:  # noqa: BLE001 — see docstring: never fail a live publish
+        return deleted, f"stale-file purge stopped: {err}; old files may linger in R2 but do not serve"
+    if failed:
+        shown = ", ".join(failed[:5]) + (" …" if len(failed) > 5 else "")
+        return deleted, f"stale-file purge could not delete {len(failed)} file(s): {shown}; they do not serve"
+    return deleted, None
+
+
 # --- Social / link-preview card --------------------------------------------
 #
 # A shared URL with no OpenGraph image makes messaging apps (iMessage, Slack,
@@ -793,21 +933,47 @@ def extract_description(markup: str) -> str | None:
     return html.unescape(re.sub(r"\s+", " ", content.group(1)).strip()) or None
 
 
-def inject_og_meta(markup: str, *, title: str, description: str | None, image_url: str, page_url: str) -> str:
+def inject_og_meta(
+    markup: str,
+    *,
+    title: str,
+    description: str | None,
+    image_url: str,
+    page_url: str,
+    image_size: tuple[int, int] | None = (1200, 630),
+    image_type: str | None = None,
+    image_alt: str | None = None,
+    site_name: str | None = None,
+) -> str:
     """Insert (or replace) an og:/twitter: meta block in the document head. The
     block is delimited by comment markers so republishing replaces it cleanly
-    rather than stacking duplicates."""
+    rather than stacking duplicates.
+
+    ``image_size`` defaults to the generated card's 1200x630. Pass None when the
+    real size is unknown: no width/height tags is honest, and a wrong pair makes
+    some previewers crop or letterbox the image to the stated shape."""
     tags = [
         '<meta property="og:type" content="website">',
         f'<meta property="og:title" content="{_esc_attr(title)}">',
         f'<meta property="og:url" content="{_esc_attr(page_url)}">',
-        f'<meta property="og:image" content="{_esc_attr(image_url)}">',
-        '<meta property="og:image:width" content="1200">',
-        '<meta property="og:image:height" content="630">',
+    ]
+    if site_name:
+        tags.append(f'<meta property="og:site_name" content="{_esc_attr(site_name)}">')
+    tags.append(f'<meta property="og:image" content="{_esc_attr(image_url)}">')
+    if image_type:
+        tags.append(f'<meta property="og:image:type" content="{_esc_attr(image_type)}">')
+    if image_size:
+        tags.append(f'<meta property="og:image:width" content="{image_size[0]}">')
+        tags.append(f'<meta property="og:image:height" content="{image_size[1]}">')
+    if image_alt:
+        tags.append(f'<meta property="og:image:alt" content="{_esc_attr(image_alt)}">')
+    tags += [
         '<meta name="twitter:card" content="summary_large_image">',
         f'<meta name="twitter:title" content="{_esc_attr(title)}">',
         f'<meta name="twitter:image" content="{_esc_attr(image_url)}">',
     ]
+    if image_alt:
+        tags.append(f'<meta name="twitter:image:alt" content="{_esc_attr(image_alt)}">')
     if description:
         desc = _esc_attr(description[:300])
         tags.insert(2, f'<meta property="og:description" content="{desc}">')
@@ -894,12 +1060,149 @@ def _entry_html(files: list[tuple[Path, str]]) -> str | None:
     return sorted(htmls)[0]
 
 
+# --- Custom link-preview image (--card-image) -------------------------------
+
+# JPEG start-of-frame markers carry the image size. C4 (DHT), C8 (JPG), and CC
+# (DAC) sit in the same range but are not frames.
+_JPEG_SOF_MARKERS = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+
+
+def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Walk JPEG segments to the first SOFn marker and read (width, height)."""
+    pos, n = 2, len(data)
+    while pos + 4 <= n:
+        if data[pos] != 0xFF:
+            return None
+        marker = data[pos + 1]
+        if marker == 0xFF:  # fill byte before a marker
+            pos += 1
+            continue
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:  # standalone, no length
+            pos += 2
+            continue
+        if marker in (0xD9, 0xDA):  # end of image / start of scan before any frame
+            return None
+        (length,) = struct.unpack(">H", data[pos + 2 : pos + 4])
+        if length < 2:
+            return None
+        if marker in _JPEG_SOF_MARKERS:
+            if pos + 9 > n:
+                return None
+            # FF Cn, length(2), precision(1), height(2), width(2)
+            height, width = struct.unpack(">HH", data[pos + 5 : pos + 9])
+            return width, height
+        pos += 2 + length
+    return None
+
+
+def _webp_dimensions(data: bytes) -> tuple[int, int] | None:
+    chunk = data[12:16]
+    if chunk == b"VP8X" and len(data) >= 30:  # extended: 24-bit canvas size minus one
+        return int.from_bytes(data[24:27], "little") + 1, int.from_bytes(data[27:30], "little") + 1
+    if chunk == b"VP8L" and len(data) >= 25 and data[20] == 0x2F:  # lossless: 14-bit fields minus one
+        bits = int.from_bytes(data[21:25], "little")
+        return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+    if chunk == b"VP8 " and len(data) >= 30 and data[23:26] == b"\x9d\x01\x2a":  # lossy key frame
+        width, height = struct.unpack("<HH", data[26:30])
+        return width & 0x3FFF, height & 0x3FFF
+    return None
+
+
+def image_dimensions(path: Path) -> tuple[int, int] | None:
+    """(width, height) of a PNG, JPEG, GIF, or WebP, read from its header with
+    the stdlib alone; None when the format or the bytes don't say. Sniffs the
+    content, not the extension, so a misnamed file is still read right."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+            dims: tuple[int, int] | None = struct.unpack(">II", data[16:24])
+        elif data[:6] in (b"GIF87a", b"GIF89a"):
+            dims = struct.unpack("<HH", data[6:10])
+        elif data[:2] == b"\xff\xd8":
+            dims = _jpeg_dimensions(data)
+        elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            dims = _webp_dimensions(data)
+        else:
+            dims = None
+    except struct.error:  # truncated header
+        return None
+    if not dims or dims[0] <= 0 or dims[1] <= 0:
+        return None
+    return int(dims[0]), int(dims[1])
+
+
+def check_card_flags(args: argparse.Namespace) -> None:
+    """Refuse card options that would be silently ignored, before any slow work.
+
+    Each of these is a flag the user expects to change the preview. If it can't,
+    the honest answer is an error now, not a preview that quietly isn't what
+    they asked for."""
+    for value in (args.card_bg, args.card_fg, args.card_accent):
+        _parse_hex_color(value, None)
+    if args.no_card:
+        used = [
+            flag
+            for flag, value in (
+                ("--card-image", args.card_image),
+                ("--card-description", args.card_description),
+                ("--card-site-name", args.card_site_name),
+                ("--card-image-alt", args.card_image_alt),
+            )
+            if value
+        ]
+        if used:
+            raise PublishError(f"{', '.join(used)} has no effect with --no-card (no preview meta is written); drop one")
+    if args.card_image:
+        colors = [
+            flag
+            for flag, value in (("--card-bg", args.card_bg), ("--card-fg", args.card_fg), ("--card-accent", args.card_accent))
+            if value
+        ]
+        if colors:
+            raise PublishError(
+                f"{', '.join(colors)} only style the generated card, and --card-image replaces it; drop one"
+            )
+        image = Path(args.card_image).expanduser()
+        if image.suffix.lower() not in CARD_IMAGE_TYPES:
+            allowed = " ".join(sorted(CARD_IMAGE_TYPES))
+            raise PublishError(f"--card-image must be one of {allowed}: {args.card_image}")
+        if not image.is_file():
+            raise PublishError(f"--card-image not found: {args.card_image}")
+
+
+def resolve_card_image(image_arg: str, files: list[tuple[Path, str]]) -> tuple[Path, str, bool]:
+    """Where a --card-image lives in the share: (source path, rel, external).
+
+    An image that is already one of the artifact's files is referenced at its
+    existing rel, so it isn't published twice. Anything else is staged in as
+    ``og.<ext>``; if the artifact already has a file at that rel, refuse rather
+    than let one silently replace the other."""
+    source = Path(image_arg).expanduser().resolve()
+    for path, rel in files:
+        if path.resolve() == source:
+            return source, rel, False
+    rel = "og" + source.suffix.lower()
+    if any(existing == rel for _, existing in files):
+        raise PublishError(
+            f"--card-image is outside the artifact and would be staged as {rel}, but the artifact "
+            f"already has a file at {rel}; pass that file as --card-image, or rename one"
+        )
+    return source, rel, True
+
+
 def stage_publish_set(
     files: list[tuple[Path, str]], slug: str, base: str, args: argparse.Namespace
 ) -> tuple[list[tuple[Path, str]], tempfile.TemporaryDirectory, dict | None, list[str]]:
     """Stage a copy of the publish set with every HTML file fixed up: an explicit
     `<meta charset="utf-8">` when the page declares no encoding, and — unless
-    --no-card — an OG card image plus og:/twitter: meta.
+    --no-card — a preview image plus og:/twitter: meta.
+
+    The preview image is the generated og.png card, or a --card-image: one of the
+    artifact's own files is referenced where it sits, and one from outside the
+    artifact is staged in as og.<ext>.
 
     Nothing here touches the user's files; the rewrites land in a temp dir that
     the caller owns and cleans up. Returns the staged (path, rel) list, that temp
@@ -916,24 +1219,48 @@ def stage_publish_set(
 
     note: dict | None = None
     png: bytes | None = None
-    title = description = None
-    image_url = page_url = ""
+    external_image: tuple[Path, str] | None = None
+    meta: dict = {}
     if card:
         title = args.card_title or extract_title(markup) or args.client or args.label or _prettify_slug(slug)
-        description = extract_description(markup)
-        image_url = f"{base}/{slug}/og.png"
+        description = args.card_description or extract_description(markup)
         page_url = f"{base}/{slug}/"
-        host = urllib.parse.urlsplit(base).netloc or base
-        bg = _parse_hex_color(args.card_bg, (11, 13, 18))
-        fg = _parse_hex_color(args.card_fg, (232, 235, 242))
-        accent = _parse_hex_color(args.card_accent, (122, 162, 255))
-        png = render_og_card(title, f"{host}/{slug}", bg=bg, fg=fg, accent=accent)
-        note = {"title": title, "image": image_url, "entry": entry}
+        if args.card_image:
+            source, image_rel, external = resolve_card_image(args.card_image, files)
+            image_size = image_dimensions(source)
+            if image_size is None:
+                warnings.append(f"--card-image {source.name}: size unreadable; og:image:width/height left out")
+            image_type = CARD_IMAGE_TYPES[source.suffix.lower()]
+            if external:
+                external_image = (source, image_rel)
+            image_source = "staged" if external else "artifact"
+        else:
+            image_rel, image_size, image_type, image_source = "og.png", (1200, 630), None, "generated"
+            host = urllib.parse.urlsplit(base).netloc or base
+            bg = _parse_hex_color(args.card_bg, (11, 13, 18))
+            fg = _parse_hex_color(args.card_fg, (232, 235, 242))
+            accent = _parse_hex_color(args.card_accent, (122, 162, 255))
+            png = render_og_card(title, f"{host}/{slug}", bg=bg, fg=fg, accent=accent)
+        image_url = f"{base}/{slug}/{urllib.parse.quote(image_rel)}"
+        meta = {
+            "title": title,
+            "description": description,
+            "image_url": image_url,
+            "page_url": page_url,
+            "image_size": image_size,
+            "image_type": image_type,
+            "image_alt": args.card_image_alt,
+            "site_name": args.card_site_name,
+        }
+        note = {"title": title, "image": image_url, "image_source": image_source, "entry": entry}
 
     # A single HTML file is the share's entry page: stage it as index.html so the
     # bare `/<slug>/` URL serves it (the Worker's single-file root fallback no
     # longer applies once og.png makes the share multi-file). With --no-card the
     # share stays single-file, so that fallback still applies and the name stands.
+    # This counts the artifact's own files only: an external --card-image is the
+    # second file just as og.png is, and an in-artifact one means it was never
+    # single-file to begin with.
     single_html = card and len(files) == 1 and entry is not None
     tmp = tempfile.TemporaryDirectory(prefix="drop-stage-")
     root = Path(tmp.name)
@@ -956,15 +1283,18 @@ def stage_publish_set(
             if fixed is not page:
                 warnings.append(f'{rel}: no encoding declared; added <meta charset="utf-8">')
             if card:
-                fixed = inject_og_meta(
-                    fixed, title=title, description=description, image_url=image_url, page_url=page_url
-                )
+                fixed = inject_og_meta(fixed, **meta)
             dest.write_text(fixed, encoding="utf-8")
         staged.append((dest, out_rel))
     if png is not None:
         og_dest = root / "og.png"
         og_dest.write_bytes(png)
         staged.append((og_dest, "og.png"))
+    if external_image is not None:
+        source, image_rel = external_image
+        image_dest = root / image_rel
+        shutil.copyfile(source, image_dest)
+        staged.append((image_dest, image_rel))
     return staged, tmp, note, warnings
 
 
@@ -983,22 +1313,154 @@ def resolve_unique_slug(base: str, admin_token: str) -> str:
     return f"{base}-{n}"
 
 
+# --- Existing shares: lookup and republish guards ---------------------------
+
+
+def admin_token() -> str:
+    return get_secret(ADMIN_TOKEN_ENV, ADMIN_TOKEN_KEYCHAIN, "Worker admin token")
+
+
+def lookup_share(slug: str, token: str) -> dict | None:
+    """The /admin/list row for exactly this slug, or None. The Worker has no
+    single-share admin read, so this filters the full list. It is a read-only
+    GET, which is why it runs even under --dry-run: the refusals and the
+    inherited settings it feeds should match what the real publish would do."""
+    data = admin_request("GET", "/admin/list", token)
+    for row in data.get("shares", []):
+        if row.get("slug") == slug:
+            return row
+    return None
+
+
+def parse_iso(value: str) -> dt.datetime:
+    """Parse a Worker timestamp. Accepts the trailing `Z` that JavaScript's
+    toISOString writes (fromisoformat only learned it in 3.11), and reads a
+    zone-less value as UTC, which is what the CLI always writes."""
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError as err:
+        raise PublishError(f"unreadable timestamp from the Worker: {value!r}") from err
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def share_expired(row: dict, now: dt.datetime | None = None) -> bool:
+    """Same rule as the Worker's isExpired: expired once expires_at <= now."""
+    expires = row.get("expires_at")
+    return bool(expires) and parse_iso(expires) <= (now or utc_now())
+
+
+VISIBILITIES = ("password", "unlisted", "public")
+
+
+def share_visibility(row: dict) -> str | None:
+    """The tier this CLI recorded for a share when it published it, or None for a
+    row published before the CLI recorded one.
+
+    The Worker can't answer this itself: unlisted and public are both
+    auth_mode="public" there. So the CLI writes its tier into the manifest's
+    scan_result, which the Worker stores verbatim and /admin/list returns. A
+    recorded tier is fact; the slug shape (looks_unlisted) is only a fallback for
+    older rows."""
+    scan = row.get("scan_result")
+    value = scan.get("visibility") if isinstance(scan, dict) else None
+    return value if value in VISIBILITIES else None
+
+
+def check_unlisted_republish(slug: str, row: dict | None) -> None:
+    """Allow --slug with --unlisted only onto a live share that is already
+    unlisted. Anything else would pass off a guessable URL as a secret link, or
+    strip a password, or revive something that was meant to end."""
+    if row is None:
+        raise PublishError(
+            f"--unlisted --slug {slug}: no share has that slug, and a new hand-picked slug has no "
+            "unguessable tail, leaving an open guessable URL; drop --slug to mint one"
+        )
+    if row.get("revoked_at"):
+        raise PublishError(
+            f"{slug} was revoked at {row['revoked_at']}; revoke is an ending, so drop --slug to mint a new unlisted link"
+        )
+    if share_expired(row):
+        raise PublishError(
+            f"{slug} expired at {row['expires_at']}; to bring it back with a new expiry, "
+            f"run `drop update {slug} --expire <duration> <path>`"
+        )
+    mode = row.get("auth_mode")
+    if mode == "password":
+        raise PublishError(
+            f"{slug} is a password share; republishing it --unlisted would remove its password. "
+            f"Use `drop update {slug} --password <its password> <path>` to keep the tier"
+        )
+    if mode != "public":
+        raise PublishError(f"{slug} has an unknown auth_mode {mode!r}; refusing to guess its tier")
+    recorded = share_visibility(row)
+    if recorded == "unlisted":
+        return
+    if recorded is not None:
+        raise PublishError(
+            f"{slug} was published as a {recorded} share, so --unlisted would not make it secret; "
+            f"republish it with `drop update {slug} <path>`, or drop --slug to mint a new unlisted link"
+        )
+    # No recorded tier (published before the CLI kept one): fall back to the slug shape.
+    if not looks_unlisted(slug):
+        raise PublishError(
+            f"{slug} is a public share with no unguessable tail, so --unlisted would not make it secret; "
+            f"republish it with `drop update {slug} <path>`, or drop --slug to mint a new unlisted link"
+        )
+
+
+def check_update_target(slug: str, row: dict | None, args: argparse.Namespace) -> None:
+    """Refuse a `drop update` that has nothing sound to inherit from."""
+    if row is None:
+        raise PublishError(f"no share named {slug}; `drop update` only republishes an existing share (see `drop list`)")
+    if row.get("revoked_at"):
+        raise PublishError(f"{slug} was revoked at {row['revoked_at']}; revoke is an ending, so publish a new share")
+    if share_expired(row) and not args.expire:
+        raise PublishError(f"{slug} expired at {row['expires_at']}; pass --expire to republish it with a new expiry")
+    mode = row.get("auth_mode")
+    if mode == "password" and not args.password:
+        # The Worker's manifest upsert requires a verifier for a password share
+        # and has no way to keep the stored one, so update can't carry the old
+        # password over. Minting a fresh one would lock out everyone who has it.
+        raise PublishError(
+            f"{slug} is a password share: pass its password with --password. Without it, update would have "
+            "to mint a new one and lock out everyone who has the current one. Recipients will still see the "
+            "login page once more, because the stored verifier is re-salted on every publish"
+        )
+    if mode == "public" and args.password:
+        raise PublishError(f"{slug} has no password, and update keeps the tier; drop --password")
+    if mode not in ("password", "public"):
+        raise PublishError(f"{slug} has an unknown auth_mode {mode!r}; refusing to guess its tier")
+
+
+def inherited_expiry(row: dict | None, args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """The expires_at for a republish onto ``row``, plus a warning or None.
+
+    --expire wins. Otherwise a future expiry carries over verbatim (the Worker's
+    own string, not a re-formatted copy), so republishing a time-boxed share
+    doesn't quietly make it permanent. A past one is dropped: the share is
+    being brought back, and keeping a past date would leave it dead on arrival."""
+    if args.expire:
+        return args.expire.isoformat(), None
+    if not row or not row.get("expires_at"):
+        return None, None
+    if share_expired(row):
+        return None, f"{row['slug']} had expired at {row['expires_at']}; the republished share has no expiry"
+    return row["expires_at"], None
+
+
+# --- Publish ----------------------------------------------------------------
+
+
 def cmd_publish(args: argparse.Namespace) -> None:
     # Reject contradictory tier combinations up front, before any slow work — a
     # silently-ignored flag here means a share the user believes is gated but
     # isn't. (--public/--unlisted are already mutually exclusive via argparse.)
     if (args.public or args.unlisted) and args.password:
         raise PublishError("--password has no effect on --public/--unlisted shares (those tiers have no password); drop one")
-    if args.unlisted and args.slug:
-        raise PublishError("--slug defeats --unlisted's unguessable tail, leaving an open guessable URL; use one or the other")
-    # Validate card colors up front so a typo fails before any slow work.
-    for value in (args.card_bg, args.card_fg, args.card_accent):
-        _parse_hex_color(value, None)
-
-    path = Path(args.path).expanduser().resolve()
-    files = iter_files(path)
-    scan_result = preflight(path, files, args)
-    public_confirm(args)
+    check_card_flags(args)
 
     # Three visibility tiers (YouTube-style):
     #   default   → password-protected ("draft"): clean readable slug + a password.
@@ -1008,26 +1470,132 @@ def cmd_publish(args: argparse.Namespace) -> None:
     # To the Worker, --unlisted and --public are both auth_mode="public"; the only
     # difference is the slug (the entropy tail), which is purely CLI-side.
     no_password = args.public or args.unlisted
-    auth_mode = "public" if no_password else "password"
+    token = None
+    expires_at = args.expire.isoformat() if args.expire else None
+    notes: list[str] = []
+    if args.slug:
+        # An explicit slug republishes in place. Look the row up before the slow
+        # preflight so a refusal costs nothing, and so the dry run inherits and
+        # refuses exactly as the real run would.
+        token = admin_token()
+        row = lookup_share(args.slug, token)
+        if args.unlisted:
+            check_unlisted_republish(args.slug, row)
+        expires_at, note = inherited_expiry(row, args)
+        if note:
+            notes.append(note)
+    publish_artifact(
+        args,
+        auth_mode="public" if no_password else "password",
+        password=None if no_password else (args.password or secrets.token_urlsafe(18)),
+        expires_at=expires_at,
+        token=token,
+        notes=notes,
+        visibility="unlisted" if args.unlisted else "public" if args.public else "password",
+    )
+
+
+def cmd_update(slug: str, args: argparse.Namespace) -> None:
+    """`drop update <slug> <path>`: republish an existing share in place, taking
+    its tier, label, and expiry from the live row instead of from this run's
+    flags. That is the difference from plain --slug, which rebuilds the manifest
+    from flags alone and so drops whatever the caller forgot to repeat."""
+    for flag, value in (("--public", args.public), ("--unlisted", args.unlisted), ("--slug", args.slug)):
+        if value:
+            raise PublishError(f"{flag} has no place in `drop update`: the slug and tier are inherited from the share")
+    check_card_flags(args)
+
+    token = admin_token()
+    row = lookup_share(slug, token)
+    check_update_target(slug, row, args)
+    assert row is not None  # check_update_target raised otherwise
+    if not (args.client or args.label) and row.get("label"):
+        # Also feeds the card title fallback, the same as a passed --label would.
+        args.label = row["label"]
+    expires_at, _ = inherited_expiry(row, args)
+    args.slug = slug
+    publish_artifact(
+        args,
+        auth_mode=row["auth_mode"],
+        # check_update_target guarantees --password on a password share; update
+        # never mints one.
+        password=args.password if row["auth_mode"] == "password" else None,
+        expires_at=expires_at,
+        token=token,
+        notes=[],
+        # Carry the recorded tier over. An older no-password row has none, and
+        # update does not guess one from the slug: an unrecorded tier stays
+        # unrecorded rather than turning a heuristic into a fact.
+        visibility=share_visibility(row) or ("password" if row["auth_mode"] == "password" else None),
+    )
+
+
+def publish_artifact(
+    args: argparse.Namespace,
+    *,
+    auth_mode: str,
+    password: str | None,
+    expires_at: str | None,
+    token: str | None,
+    notes: list[str],
+    visibility: str | None,
+) -> None:
+    """The one publish path behind both `drop <path>` and `drop update`: scan,
+    stage, upload, write the manifest, and (for a republish) purge stale files.
+
+    ``args.slug`` set means an in-place republish onto that exact slug; unset
+    means a fresh share whose slug is derived and made unique here. The caller
+    has already settled the tier, password, and expiry."""
+    path = Path(args.path).expanduser().resolve()
+    files = iter_files(path)
+    if not args.no_card and not _html_files(files):
+        # The preview lives in og: meta inside an HTML page. With no HTML there is
+        # nowhere to put it, so these would be silently ignored.
+        used = [
+            flag
+            for flag, value in (
+                ("--card-image", args.card_image),
+                ("--card-description", args.card_description),
+                ("--card-site-name", args.card_site_name),
+                ("--card-image-alt", args.card_image_alt),
+            )
+            if value
+        ]
+        if used:
+            raise PublishError(f"{', '.join(used)} needs an HTML page to carry the preview, and {path.name} has none")
+    # An external --card-image is published too, so it gets the same filename,
+    # PII, and OCR scans as the artifact's own files. (Only when there is HTML
+    # to carry the preview; otherwise nothing is staged and nothing uploads.)
+    scanned = files
+    if args.card_image and not args.no_card and _html_files(files):
+        source, _, external = resolve_card_image(args.card_image, files)
+        if external:
+            scanned = files + [(source, source.name)]
+    scan_result = preflight(path, scanned, args)
+    if visibility:
+        scan_result["visibility"] = visibility
+    public_confirm(args)
+
+    in_place = bool(args.slug)
+    label = args.client or args.label
     # Readable slug source: an explicit label wins, else the artifact's own
     # file/dir name (a file's extension is dropped — `report.html` -> `report`).
     base_name = path.stem if path.is_file() else path.name
-    slug = args.slug or generated_slug(args.client or args.label or base_name, secret=args.unlisted)
-    password = None if no_password else (args.password or secrets.token_urlsafe(18))
+    slug = args.slug or generated_slug(label or base_name, secret=args.unlisted)
     created_at = utc_now().isoformat()
     base = base_url()
 
     # Resolve the final slug BEFORE building the card: the og:image URL and og:url
     # embed it. Auto-generated slugs get a unique name on clash (ted-page-2, …);
     # an explicit --slug is honored as-is so a known share republishes in place.
-    admin_token = None
     if not args.dry_run:
-        admin_token = get_secret(ADMIN_TOKEN_ENV, ADMIN_TOKEN_KEYCHAIN, "Worker admin token")
-        if not args.slug:
-            slug = resolve_unique_slug(slug, admin_token)
+        if token is None:
+            token = admin_token()
+        if not in_place:
+            slug = resolve_unique_slug(slug, token)
 
     # Stage the HTML: an explicit <meta charset="utf-8"> when the page declares no
-    # encoding, plus (unless --no-card) a link-preview card and og:/twitter: meta
+    # encoding, plus (unless --no-card) a link-preview image and og:/twitter: meta
     # so shared links render a landscape card instead of a tall screenshot. Only
     # runs when the share actually contains HTML.
     published = files
@@ -1041,14 +1609,14 @@ def cmd_publish(args: argparse.Namespace) -> None:
         artifact_sha, total_bytes, file_rows = digest_files(published)
         manifest = {
             "slug": slug,
-            "label": args.client or args.label,
+            "label": label,
             "auth_mode": auth_mode,
             "sha256": artifact_sha,
             "files": file_rows,
             "bytes": total_bytes,
             "scan_result": scan_result,
             "created_at": created_at,
-            "expires_at": args.expire.isoformat() if args.expire else None,
+            "expires_at": expires_at,
             "uploader": f"{_actor()}@{socket.gethostname()}",
             "override_log": scan_result["override_log"],
         }
@@ -1060,19 +1628,47 @@ def cmd_publish(args: argparse.Namespace) -> None:
             return
 
         upload_r2(published, slug)
-        admin_request("POST", "/admin/manifest", admin_token, manifest)
+        admin_request("POST", "/admin/manifest", token, manifest)
     finally:
         if card_tmp is not None:
             card_tmp.cleanup()
+
+    # Only a republish can leave stale files: a fresh auto-named slug was free
+    # (resolve_unique_slug saw no row), so its prefix held nothing to begin with.
+    purged = 0
+    if in_place:
+        # Two republishes of one slug can overlap. If another one's manifest
+        # landed after ours, its files are live and ours are the stale ones, so a
+        # purge from here would delete the winner's bytes. Purge only while the
+        # live row still carries this publish's digest. (This narrows the race to
+        # the purge itself; closing it fully needs a conditional write on the
+        # Worker.)
+        try:
+            live = lookup_share(slug, token)
+        except PublishError as err:
+            live, purge_warning = None, f"stale-file purge skipped: could not re-read {slug}: {err}"
+        else:
+            purge_warning = None if live else f"stale-file purge skipped: {slug} is missing from /admin/list"
+        if live and live.get("sha256") != artifact_sha:
+            live, purge_warning = None, f"stale-file purge skipped: a newer publish has landed on {slug}"
+        if live:
+            purged, purge_warning = purge_stale_objects(slug, {rel for _, rel in published})
+        if purge_warning:
+            notes.append(purge_warning)
 
     print(f"url: {base}/{slug}/")
     if card_note:
         print(f"card: {card_note['image']}")
     if password:
         print(f"password: {password}")
-    if scan_result["warnings"]:
+    if expires_at:
+        print(f"expires: {expires_at}")
+    if purged:
+        print(f"purged: {purged} stale file{'' if purged == 1 else 's'}")
+    warnings = scan_result["warnings"] + notes
+    if warnings:
         print("warnings:", file=sys.stderr)
-        for warning in scan_result["warnings"]:
+        for warning in warnings:
             print(f"  - {warning}", file=sys.stderr)
 
 
@@ -1150,8 +1746,8 @@ def cmd_scope_test(_: argparse.Namespace) -> None:
         print(f"scope-test passed: upload creds write '{bucket}' OK (no forbidden bucket configured to deny-check)")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="drop")
+def build_parser(prog: str = "drop") -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=prog)
     parser.add_argument("--client", help="client/recipient label; sets the readable slug (default: the file/dir name)")
     parser.add_argument("--label", help="internal label when --client is not appropriate; also sets the readable slug")
     # Visibility (default = password-protected). --public and --unlisted both drop
@@ -1167,11 +1763,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--card-bg", metavar="HEX", help="card background color, e.g. #0b0d12")
     parser.add_argument("--card-fg", metavar="HEX", help="card title color, e.g. #e8ebf2")
     parser.add_argument("--card-accent", metavar="HEX", help="card accent color, e.g. #7aa2ff")
+    parser.add_argument("--card-description", metavar="TEXT", help="preview description (default: the page's meta description)")
+    parser.add_argument("--card-image", metavar="PATH", help="use this .png/.jpg/.gif/.webp as the preview image instead of generating a card")
+    parser.add_argument("--card-image-alt", metavar="TEXT", help="alt text for the preview image (og:image:alt, twitter:image:alt)")
+    parser.add_argument("--card-site-name", metavar="TEXT", help="site name shown with the preview (og:site_name)")
     parser.add_argument("--no-card", action="store_true", help="do not generate a link-preview card or inject preview meta tags")
-    # Republish verb: an exact slug skips the clash resolver, so the bytes land on
-    # that slug's own prefix and the manifest row is upserted in place. Unvalidated
-    # by design (no existence check) — a typo publishes a new share, so copy the
-    # slug out of `drop list` rather than retyping it.
+    # Republish: an exact slug skips the clash resolver, so the bytes land on that
+    # slug's own prefix and the manifest row is upserted in place. The row is
+    # looked up (for expiry, and for --unlisted's checks) but a slug with no row is
+    # still allowed — a typo publishes a new share, so copy the slug out of `drop
+    # list`, or use `drop update`, which refuses an unknown slug.
     parser.add_argument("--slug", metavar="SLUG", help="republish in place at an exact existing slug, keeping the URL (skips the -2/-3 clash suffix)")
     parser.add_argument("--allow-secret", metavar="REASON", help="override gitleaks findings; reason is logged")
     parser.add_argument("--allow-pii", metavar="REASON", help="override high-confidence PII findings; reason is logged")
@@ -1204,6 +1805,18 @@ def main(argv: list[str] | None = None) -> int:
             die("usage: drop views <slug>", code=2)
         try:
             cmd_views(argparse.Namespace(slug=argv[1]))
+            return 0
+        except PublishError as err:
+            die(str(err))
+    if argv and argv[0] == "update":
+        usage = "usage: drop update <slug> [flags] <path>"
+        if len(argv) < 2 or argv[1].startswith("-"):
+            die(usage, code=2)
+        args = build_parser(prog="drop update <slug>").parse_args(argv[2:])
+        if not args.path:
+            die(usage, code=2)
+        try:
+            cmd_update(argv[1], args)
             return 0
         except PublishError as err:
             die(str(err))

@@ -98,39 +98,61 @@ and takes the readable name if it's free. If it's taken, it appends `-2`, `-3`, 
   before.
 - The Worker stores by slug (an upsert), which is exactly **why the CLI owns
   clash-avoidance**: the edge would happily overwrite, so the client makes sure it
-  never has to. (`--slug` forces an exact slug and skips the clash check — that's
-  how a known share republishes in place.)
+  never has to. (`drop update <slug>` and `--slug` target an exact slug and skip
+  the clash check — that's how a known share republishes in place.)
 
 ### Republishing in place
 
-There's no `update` subcommand — `--slug` is one. An exact slug skips the clash
-resolver, so the bytes upload onto that slug's own prefix and the manifest row is
-upserted where it already sits, clearing any revocation. `created_at` and the
-view history survive.
+`drop update <slug> <path>` republishes an existing share at the same URL. It
+reads the share's row first and keeps what you don't pass: the tier, the label,
+and the expiry. The bytes upload onto that slug's own prefix, and the manifest
+row is upserted where it sits. `created_at` and the view history survive.
 
 ```bash
-drop --slug quarterly-report --password "$pw" build/report.html
+drop update quarterly-report --password "$pw" build/report.html
+drop update acme-proposal-k7f3m9q2x8p4n6tz build/report.html   # unlisted: no password
 ```
 
-Three things that bite:
-
-- **The manifest is rebuilt from this run's flags alone** — nothing merges with
-  the row you're replacing. Omit `--password` and a fresh one is minted; omit
-  `--expire`, `--client`/`--label`, or `--public` and the expiry, label, or public
-  tier clears.
+- **Pass a flag to change a setting.** `--label`/`--client` and `--expire`
+  replace the inherited value. `--public`, `--unlisted`, and `--slug` are
+  refused, because the slug and the tier come from the share.
+- **A password share needs `--password` every time.** The Worker can't keep the
+  stored verifier yet, so `update` refuses rather than mint a new password and
+  lock out everyone who has the current one.
 - **No republish keeps recipients logged in.** The verifier re-salts on every
   publish — same password, different hash — and the login cookie binds that hash,
   so every live cookie dies either way.
-- **`--slug` is unvalidated**: a typo silently mints a new share at the misspelled
-  URL instead of failing, and a value the Worker won't route (it accepts 2–128
-  characters, starting alphanumeric, otherwise `[a-z0-9._-]`) publishes a share
-  whose own URL 404s. Copy the slug out of `drop list`.
+- **It refuses a share it can't sensibly continue:** an unknown slug, a revoked
+  share (revoke is an ending), or an expired one unless you pass `--expire`.
 
-A republish doesn't purge R2 (only `drop revoke` does), but removed files stop
-serving — the Worker gates every request against the current manifest's file
-list. And never fake an update by grafting a temp slug's manifest onto a stable
-one via `/admin/manifest`: R2 keys are derived from the *requested* slug, so the
-graft repoints nothing and the follow-up revoke deletes the bytes.
+`--slug` is the lower-level form. It also skips the clash resolver, but it
+rebuilds the manifest from this run's flags. Omit `--password` and a fresh one is
+minted; omit `--client`/`--label` or `--public` and the label or the public tier
+clears. Only the expiry carries over: a future `expires_at` is kept unless you
+pass `--expire`. And `--slug` is unvalidated — a typo mints a new share at the
+misspelled URL, and a value the Worker won't route (it accepts 2–128 characters,
+starting alphanumeric, otherwise `[a-z0-9._-]`) publishes a share whose own URL
+404s. Copy the slug out of `drop list`.
+
+`--slug` with `--unlisted` works only onto a live share that is already
+unlisted: no password, and a slug ending in the 16-character random tail. A new
+hand-picked slug has no tail, a password share would lose its password, and a
+public slug would stay guessable, so each of those is refused. Each publish
+records its tier in the manifest (`scan_result.visibility`), and that record
+beats the slug shape. Older rows without one fall back to the shape: a
+16-character tail with at least one digit.
+
+Both forms look up the share before the preflight, even with `--dry-run`, so
+they need the admin token.
+
+After the new manifest lands, a republish deletes the files the new build
+dropped and prints `purged: N stale files`. It skips the purge if the live
+digest has changed since its own manifest landed (another republish won). A failed purge is only a warning,
+because the share is already live; the leftovers don't serve either way, since
+the Worker gates every request against the current manifest's file list. And
+never fake an update by grafting a temp slug's manifest onto a stable one via
+`/admin/manifest`: R2 keys are derived from the *requested* slug, so the graft
+repoints nothing and the follow-up revoke deletes the bytes.
 
 ---
 
@@ -158,6 +180,7 @@ purely a difference in how the **slug** is shaped (entirely CLI-side).
   found. To the Worker it's identical to unlisted (`auth_mode="public"`).
 
 Pair any tier with `--expire 7d` and `drop revoke <slug>` for time-boxed shares.
+`drop update <slug>` keeps whichever tier the share already has.
 
 ---
 
@@ -180,6 +203,28 @@ drop --public --card-title "Q3 Board Deck" ...   # override the card title
 drop --public --card-bg "#0b0d12" --card-accent "#5ce0c0" ...   # custom colors
 drop --public --no-card ...                       # opt out entirely
 ```
+
+To use your own preview instead of the generated card:
+
+```bash
+drop --public --card-image hero.jpg \
+  --card-description "Ten days in Tokyo" \
+  --card-site-name "Trips" --card-image-alt "Shibuya at night" path/to/site
+```
+
+- `--card-image` takes a `.png`, `.jpg`, `.jpeg`, `.gif`, or `.webp`. A file
+  inside the artifact is referenced where it sits. A file from elsewhere is
+  uploaded as `og.<ext>` and goes through the same preflight scans as the
+  artifact's own files.
+- The CLI reads the image's size from its header and writes
+  `og:image:width`/`height`. If it can't read the size, it leaves those two tags
+  out rather than claim 1200×630.
+- `--card-description` replaces the page's meta description. `--card-site-name`
+  sets `og:site_name`, and `--card-image-alt` sets the image alt text. Each tag is
+  written only when you pass its flag.
+- The CLI refuses a flag it would ignore: any of these with `--no-card` or on an
+  artifact with no HTML page, and
+  `--card-bg`/`--card-fg`/`--card-accent` with `--card-image`.
 
 The renderer is **pure Python stdlib** — a small `zlib`/`struct` PNG encoder and
 an embedded public-domain 8×8 bitmap font — so it adds no third-party dependency
@@ -311,7 +356,7 @@ drop/
 │   ├── drop-gitleaks.toml       # bundled gitleaks config for the preflight
 │   └── test/                    # CLI unit tests (`python3` — stdlib only)
 │       ├── card.test.py         #   link-preview card
-│       └── drop.test.py         #   list/views output
+│       └── drop.test.py         #   list/views, republish, purge
 ├── worker/
 │   ├── src/worker.mjs           # the edge Worker
 │   ├── schema.sql               # D1 schema: shares + audit_events
@@ -385,7 +430,7 @@ publish images). Symlink `cli/drop` somewhere on your `PATH`.
 ```bash
 cd worker && npm test            # Worker — or: node test/worker.test.mjs
 python3 cli/test/card.test.py    # CLI link-preview card (stdlib only)
-python3 cli/test/drop.test.py    # CLI list/views output (offline, no creds)
+python3 cli/test/drop.test.py    # CLI list/views, republish, purge (offline, no creds)
 ```
 
 ---
@@ -398,8 +443,10 @@ drop --client "Acme" path/to/report            # password, readable slug "acme-�
 drop --unlisted --client "Acme" path/to/report # secret link: no password, unguessable URL
 drop --public path/to/site                     # truly public: no password, guessable URL
 drop --password "$pw" --expire 7d path/to/site # explicit password + 7-day expiry
-drop --slug acme-proposal --password "$pw" ... # republish in place, keeping the same URL
+drop update acme-proposal --password "$pw" ... # republish in place: same URL, keeps tier/label/expiry
+drop --slug acme-proposal --password "$pw" ... # republish at an exact slug, settings from flags
 drop --public --card-title "Q3 Deck" path/site # override the generated link-preview card title
+drop --public --card-image hero.jpg path/site  # use your own preview image instead of the card
 drop --public --no-card path/to/site           # skip the link-preview card + meta tags
 drop --dry-run path/to/site                    # run preflight + print the manifest, upload nothing
 drop list                                      # list every share (with a views=N column)
