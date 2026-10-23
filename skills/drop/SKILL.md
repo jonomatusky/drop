@@ -1,6 +1,6 @@
 ---
 name: drop
-description: Publish a local static artifact — an HTML report, generated doc, screenshot bundle, or a directory of files — to a public URL with the `drop` CLI. Use when asked to share, publish, or put something on the web where anyone with the link can reach it. Covers the three visibility tiers, republishing an existing share in place at the same URL (`--slug`), listing/inspecting/revoking shares, and verifying that what's served is the build you just made.
+description: Publish a local static artifact — an HTML report, generated doc, screenshot bundle, or a directory of files — to a public URL with the `drop` CLI. Use when asked to share, publish, or put something on the web where anyone with the link can reach it. Covers the three visibility tiers, republishing an existing share in place at the same URL (`drop update`, `--slug`), custom link previews, listing/inspecting/revoking shares, and verifying that what's served is the build you just made.
 ---
 
 # drop
@@ -27,8 +27,10 @@ drop --client "Acme" path/to/report            # password, readable slug "acme-�
 drop --unlisted --client "Acme" path/to/report # secret link: no password, unguessable URL
 drop --public path/to/site                     # truly public: no password, guessable URL
 drop --password "$pw" --expire 7d path/to/site # explicit password + 7-day expiry
-drop --slug acme-proposal --password "$pw" path/to/report   # republish IN PLACE (same URL)
+drop update acme-proposal --password "$pw" path/to/report  # republish IN PLACE (same URL, keeps tier/label/expiry)
+drop --slug acme-proposal --password "$pw" path/to/report   # republish at an exact slug; settings from flags
 drop --public --card-title "Q3 Deck" path/site # override the link-preview card title
+drop --public --card-image hero.jpg path/site  # your own preview image instead of the card
 drop --public --no-card path/to/site           # skip the card and the preview meta tags
 drop --dry-run path/to/site                    # preflight + print the manifest, upload nothing
 drop list                                      # every share, with a views=N column
@@ -92,11 +94,13 @@ Every publish is gated by a local scan before a single byte leaves the machine:
   in automation.
 
 `--dry-run` runs the whole preflight and prints the manifest without uploading —
-the file list, the per-file digests, and the URL. One gap: it never calls the
-admin API, so it doesn't resolve the clash suffix. An auto-named dry run prints
-`…/report/` while the real publish may land on `…/report-2/`, taking the injected
-og URLs and that page's digest with it. Pass an explicit `--slug` when the
-dry-run output has to match the publish exactly.
+the file list, the per-file digests, and the URL. One gap: an auto-named dry run
+doesn't resolve the clash suffix. It prints `…/report/` while the real publish
+may land on `…/report-2/`, taking the injected og URLs and that page's digest
+with it. Pass an explicit `--slug` (or use `drop update`) when the dry-run output
+has to match the publish exactly. Those two forms do read the admin API in a dry
+run — one `GET /admin/list` to look up the share — so they need the admin token,
+and they refuse and inherit exactly as the real run would.
 
 ## Slugs and URLs
 
@@ -108,26 +112,33 @@ On a clash the CLI appends `-2`, `-3`, … rather than a random id — and **eve
 existing share counts as taken, including expired and revoked ones, so an
 auto-named publish never silently overwrites something you published before.
 
-An explicit `--slug` is the deliberate exception. It is the update verb.
+`drop update <slug>` and an explicit `--slug` are the deliberate exceptions.
+They are the update verbs.
 
 ## Republishing in place (one stable URL)
 
-There is no `update` subcommand; `--slug` is it. An explicit slug skips the
-uniqueness resolver, so there's no `-2` suffix — the bytes upload onto that
-slug's own prefix and the manifest upsert updates the row already sitting there,
-clearing any revocation. `created_at` and the view history survive.
+Use `drop update`. It looks up the share's row, keeps its slug, tier, label, and
+expiry, and republishes onto it — no `-2` suffix. The bytes upload onto that
+slug's own prefix and the manifest upsert updates the row already sitting there.
+`created_at` and the view history survive.
 
 ```bash
-drop --slug quarterly-report --password "$pw" --yes build/report.html
+drop update quarterly-report --password "$pw" --yes build/report.html
+drop update acme-proposal-k7f3m9q2x8p4n6tz --yes build/report.html   # unlisted
 ```
 
-Four things to know before rerunning it:
+Every other publish flag works under `update` (`--card-*`, `--dry-run`,
+`--allow-*`, `--yes`). Pass `--label`/`--client` or `--expire` to replace the
+inherited value. `--public`, `--unlisted`, and `--slug` are refused: the slug and
+the tier are the share's. It also refuses an unknown slug, a revoked share, and
+an expired one unless you pass `--expire`.
 
-- **Pass every flag again, every time.** The manifest is rebuilt from this run's
-  flags alone — nothing merges with the row you're replacing. Omit `--password`
-  and the CLI mints a fresh random one; omit `--expire` and the expiry clears;
-  omit `--client`/`--label` and the label clears; omit `--public` and a public
-  share silently reverts to password-gated.
+Four things to know before rerunning a republish:
+
+- **A password share needs `--password` every time.** The Worker can't keep the
+  stored verifier yet, so `update` refuses without it rather than mint a new
+  password and lock out everyone who has the current one. Plain `--slug` has no
+  such guard: omit `--password` there and it mints a fresh random one.
 - **No republish keeps recipients logged in.** The password verifier takes a
   fresh random salt on every publish — same password, different hash — and the
   login cookie is a MAC over slug + verifier hash, so every live cookie stops
@@ -135,19 +146,25 @@ Four things to know before rerunning it:
   eventually consistent, so a stale edge can honor the old one briefly).
   Passing the same `--password` preserves the password they already have; it
   does not spare them the login page.
-- **`--slug` is unvalidated.** No existence check, no format check. A typo
-  doesn't fail — it silently mints a new share at the misspelled URL while the
-  real one goes stale. Worse, the Worker only routes a slug of 2–128 characters
-  that starts alphanumeric and is otherwise `[a-z0-9._-]`; a value outside that
-  shape still uploads the objects and writes the row, and then every request to
-  it 404s. Copy the slug out of `drop list`; don't retype it.
-- **`--slug` and `--unlisted` are mutually exclusive.** The CLI refuses the
-  combination, because a fixed slug defeats the unguessable tail. To republish an
-  existing unlisted share, pass its full secret slug plus `--public`.
+- **Plain `--slug` rebuilds the manifest from this run's flags.** Only the expiry
+  carries over: a future `expires_at` is kept unless you pass `--expire`. Omit
+  `--client`/`--label` and the label clears; omit `--public` and a public share
+  silently reverts to password-gated. `--slug` is also unvalidated. A typo
+  doesn't fail — it mints a new share at the misspelled URL while the real one
+  goes stale — and the Worker only routes a slug of 2–128 characters that starts
+  alphanumeric and is otherwise `[a-z0-9._-]`, so a value outside that shape
+  uploads and then 404s. `drop update` refuses an unknown slug; prefer it.
+- **`--slug` with `--unlisted` works only onto a live unlisted share** — no
+  password, and a slug ending in the 16-character random tail. The CLI refuses an
+  unknown slug (a hand-picked slug has no unguessable tail), a password share (it
+  would lose its password), a public slug with no tail (it would stay guessable),
+  and a revoked or expired share.
 
-A republish does not purge R2; only `drop revoke` does. Rebuilding with fewer
-files leaves the removed objects in the bucket, but they stop serving — the
-Worker gates every request against the current manifest's file list.
+After the manifest lands, a republish lists the slug's prefix in R2 and deletes
+every file the new build no longer has. It prints `purged: N stale files` when it
+removed any. A purge failure is a warning on stderr, not a failed publish: the
+share is already live, and the leftovers don't serve anyway, because the Worker
+gates every request against the current manifest's file list.
 
 One window to know about: the bytes go to R2 **before** the manifest POST, and
 the row keeps its old values until that POST lands. So between the two, the live
@@ -193,8 +210,8 @@ exactly like a healthy one, and its 404 appears only once you're past the gate.
 So verify past the gate — and compare against the *published* build, not the file
 on disk. Any share containing HTML goes through staging first
 (`stage_publish_set` in `cli/drop`), which on the default path adds og:/twitter:
-meta, renames a lone HTML file to `index.html`, and uploads an extra `og.png` —
-plus a `<meta charset="utf-8">` on any page that declares no encoding. So the
+meta, renames a lone HTML file to `index.html`, and uploads an extra `og.png`
+(or an outside `--card-image` as `og.<ext>`) — plus a `<meta charset="utf-8">` on any page that declares no encoding. So the
 served entry page is usually **not** byte-identical to the file you built. (The
 exceptions: `--no-card` leaves an already-charset-declaring page untouched, HTML
 that isn't valid UTF-8 is copied through byte-for-byte with a warning, and a
@@ -303,6 +320,28 @@ meta into the published HTML — so a shared link renders as a card instead of a
 skinny screenshot of a tall page. The card title defaults to the page `<title>`;
 `--card-title`, `--card-bg`, `--card-fg`, and `--card-accent` override it, and
 `--no-card` opts out.
+
+To use your own preview, pass `--card-image <file>` (`.png`, `.jpg`, `.jpeg`,
+`.gif`, or `.webp`) instead of hand-writing og tags with `--no-card`:
+
+```bash
+drop --unlisted --card-image hero.jpg --card-description "Ten days in Tokyo" \
+  --card-site-name "Trips" --card-image-alt "Shibuya at night" --yes site/
+```
+
+- An image inside the artifact is referenced at its own path. One from elsewhere
+  is uploaded as `og.<ext>`, and the CLI refuses if the artifact already has a
+  file there. An outside image gets the same filename, PII, and OCR scans as the
+  artifact.
+- `og:image:width`/`height` come from the image's own header. If the CLI can't
+  read the size, it leaves both tags out.
+- `--card-description` replaces the page's meta description, `--card-site-name`
+  sets `og:site_name`, and `--card-image-alt` sets `og:image:alt` and
+  `twitter:image:alt`. Each tag is written only when you pass its flag.
+- The CLI refuses a flag it would ignore: any of those four with `--no-card`, and
+  the color flags with `--card-image`.
+- The `card:` line in the output (and `card.image` in a dry run) is the image URL
+  actually used.
 
 These rewrites happen in a temp staging copy. Your source files are never
 modified.
