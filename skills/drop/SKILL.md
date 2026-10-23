@@ -32,6 +32,7 @@ drop --slug acme-proposal --password "$pw" path/to/report   # republish at an ex
 drop --public --card-title "Q3 Deck" path/site # override the link-preview card title
 drop --public --card-image hero.jpg path/site  # your own preview image instead of the card
 drop --public --no-card path/to/site           # skip the card and the preview meta tags
+drop --public-preview path/to/site             # password share whose link preview shows without the password
 drop --dry-run path/to/site                    # preflight + print the manifest, upload nothing
 drop list                                      # every share, with a views=N column
 drop views <slug>                              # who opened it: count + recent timestamps / IPs / UAs
@@ -133,7 +134,7 @@ inherited value. `--public`, `--unlisted`, and `--slug` are refused: the slug an
 the tier are the share's. It also refuses an unknown slug, a revoked share, and
 an expired one unless you pass `--expire`.
 
-Four things to know before rerunning a republish:
+Five things to know before rerunning a republish:
 
 - **A password share needs `--password` every time.** The Worker can't keep the
   stored verifier yet, so `update` refuses without it rather than mint a new
@@ -162,6 +163,9 @@ Four things to know before rerunning a republish:
   manifest's `scan_result.visibility`, and the CLI trusts that record over the
   slug shape. Only rows published before that record existed fall back to the
   shape check: a 16-character tail with at least one digit.
+- **`--public-preview` is not inherited.** Neither `update` nor `--slug` carries
+  it over. Pass it again on every republish that should keep the preview; leave
+  it out and the preview turns off.
 
 After the manifest lands, a republish lists the slug's prefix in R2 and deletes
 every file the new build no longer has. It prints `purged: N stale files` when it
@@ -306,6 +310,18 @@ Non-browser clients keep using Basic Auth: `curl -u anything:<password>
 https://drop.example.com/<slug>/` works, since the username is ignored and only
 the password is checked. `--public` and `--unlisted` shares skip the page.
 
+A share published with `--public-preview` adds preview tags to this page, and
+its root `og.png` answers without the password. That is the only
+unauthenticated request that reaches R2, so it proves the card's bytes exist and
+nothing about the rest of the build. Verify the rest past the gate as above.
+The Worker serves that card only while its bytes hash to the sha256 that the
+manifest's preview record and its `og.png` row carry. The preview is part of
+the manifest, so it changes with the manifest write, with no KV delay. The CLI
+uploads to R2 before it writes the manifest. So while a republish that changes
+the card is in flight, the unauthenticated `og.png` gets the login page. That
+is the check working, not a failed publish; check again once the publish
+returns.
+
 ## View tracking
 
 Each time a share's document is opened, the Worker logs one `view` — one row per
@@ -351,8 +367,45 @@ drop --unlisted --card-image hero.jpg --card-description "Ten days in Tokyo" \
 These rewrites happen in a temp staging copy. Your source files are never
 modified.
 
-The card only reaches an audience on a no-password share. A crawler fetching a
-password-gated URL gets the login page, which carries none of the staged meta —
-so the injected tags do nothing until someone is past the gate. If a link needs
-to preview well in a chat app, that's an argument for `--unlisted` over the
-password tier.
+By default the card only reaches an audience on a no-password share. A crawler
+fetching a password-gated URL gets the login page, which carries none of the
+staged meta, so the injected tags do nothing until someone is past the gate.
+
+To let a password share preview in a chat app, pass `--public-preview`:
+
+```bash
+drop --public-preview --card-title "Project proposal" --yes site/
+```
+
+- The login page then carries the preview tags, and exactly one file loads
+  without the password: the generated card at `<slug>/og.png`. Every other path
+  still needs the password. `--card-site-name` and `--card-image-alt` carry
+  through to `og:site_name`, `og:image:alt` and `twitter:image:alt`, with the
+  same values as the staged page.
+- **The preview is part of the published manifest.** The Worker stores it in
+  the share's D1 row, written with the manifest. The next publish without the
+  flag turns it off in that same write.
+- **Only the exact card bytes load.** The manifest carries the card's sha256,
+  and the Worker serves `og.png` without the password only while the preview
+  record, the manifest's `og.png` row, and the R2 bytes all agree. An R2
+  overwrite gets the login page, never new bytes.
+- **The card title must be plain ASCII and fit.** The card draws only printable
+  ASCII, in at most five lines. With this flag the CLI refuses a title with
+  other characters (they would show as `?`) or one that would be clipped. Pass
+  an ASCII `--card-title`, or a shorter one.
+- **The public values get a PII scan.** Before the publish prompt, the CLI scans
+  the final title, description, site name and alt text, after HTML entity
+  decoding, with the preflight's PII scan. A high-confidence finding blocks the
+  publish unless `--allow-pii REASON`, which is logged as a `preview-pii`
+  override.
+- **What becomes public:** the card title, the description, the site name, the
+  alt text, and the `og.png` card. Anyone who knows or guesses the slug sees
+  them, and password slugs are readable words. Put nothing secret in them.
+- **It is not inherited.** A republish with `drop update` or `--slug` turns it
+  off unless you pass `--public-preview` again.
+- The CLI refuses it with `--public`/`--unlisted` (those already preview), with
+  `--no-card`, on an artifact with no HTML page, and with `--card-image`. The
+  flag exposes only the generated title card, because a custom image is often a
+  photo; that is a deliberate limit for now.
+- The output adds a `preview: public …` line, and a dry run shows the `preview`
+  object in the manifest.
