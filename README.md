@@ -239,22 +239,36 @@ drop --public-preview --card-title "Project proposal" path/to/site
 ```
 
 - The login page carries the share's `og:`/`twitter:` tags: the card title, the
-  description, and the card image.
+  description, the card image, and the `--card-site-name` and
+  `--card-image-alt` values when you pass them. These are the same values the
+  staged page carries.
 - Exactly one file loads without the password: the generated title card at
   `…/<slug>/og.png`. Every other path, including any other image, still needs
   the password.
+- **The preview is part of the published manifest.** The Worker stores it in
+  the share's D1 row with the manifest itself, so every publish sets or clears
+  it in the same write. The next publish without `--public-preview` turns it
+  off at once. There is no KV delay.
 - **Only the exact card bytes load.** The manifest carries the card's sha256.
-  The Worker serves `og.png` without the password only while the manifest, the
-  stored preview, and the bytes in R2 all agree on it. Any mismatch gets the
-  plain login page, so a stale preview or a half-done republish can never
-  expose new bytes. Right after a republish that changes the card, the
-  unauthenticated card can show the login page for about a minute.
-- The card draws only plain ASCII, in at most five lines. With this flag the
-  CLI warns when the title has other characters (they show as `?`) or is too
-  long, because then the public card does not match `og:title`.
-- **What becomes public:** the title, the description, and the `og.png` card.
-  Anyone who knows or guesses the slug can see them, and password slugs are
-  readable words. Keep anything secret out of the title and description.
+  The Worker serves `og.png` without the password only while the preview
+  record, the manifest's `og.png` row, and the bytes in R2 all agree on it. Any
+  mismatch gets the plain login page, so a half-done republish can never expose
+  new bytes. The CLI uploads to R2 before it writes the manifest, so while a
+  republish that changes the card is in flight, the unauthenticated card shows
+  the login page.
+- **The card title must be plain ASCII and fit.** The card draws only printable
+  ASCII, in at most five lines. With this flag the CLI refuses a title with
+  other characters (they would show as `?`) or one too long to fit, because the
+  public card would not match `og:title`. Pass an ASCII `--card-title`, or a
+  shorter one.
+- **The public values get a PII scan.** Before the publish prompt, the CLI runs
+  the preflight's PII scan over the final title, description, site name and alt
+  text, after HTML entity decoding: they are what a chat app shows. A
+  high-confidence finding (for example an SSN-like value) blocks the publish
+  unless you pass `--allow-pii REASON`, which is logged as with the preflight.
+- **What becomes public:** the title, the description, the site name, the alt
+  text, and the `og.png` card. Anyone who knows or guesses the slug can see
+  them, and password slugs are readable words. Keep anything secret out of them.
 - **It is not inherited.** A republish with `--slug` or `drop update` turns the
   preview off unless you pass `--public-preview` again.
 - It is off by default. The CLI refuses it with `--public` or `--unlisted`
@@ -551,11 +565,14 @@ only the share's label.
 - By default the login page has no link-preview tags. A share published with
   `--public-preview` adds them, and serves its root `og.png` card without the
   password (see [Previews on a password share](#previews-on-a-password-share---public-preview)).
-  The Worker keeps that opt-in in `AUTH_KV` under `preview:<slug>`: the
-  title, the description, and the card's sha256. Every publish sets or clears
-  it, and revoke deletes it. The card loads without the password only while
-  that sha256 matches both the current manifest's `og.png` row and the bytes in
-  R2. The login page carries the tags only while it matches the manifest.
+  The Worker keeps that opt-in in the share's D1 row, as
+  `scan_result.public_preview`: the title, description, site name, alt text,
+  and the card's sha256. It writes that field only from a validated `preview`
+  in the manifest, and strips any copy a client sends, so every publish sets or
+  clears it in the same write as the manifest. A revoked share is refused before
+  the preview is read. The card loads without the password only while that
+  sha256 matches both the manifest's `og.png` row and the bytes in R2. The login
+  page carries the tags only while it matches the manifest.
 
 ---
 

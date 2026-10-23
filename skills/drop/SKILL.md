@@ -314,11 +314,13 @@ A share published with `--public-preview` adds preview tags to this page, and
 its root `og.png` answers without the password. That is the only
 unauthenticated request that reaches R2, so it proves the card's bytes exist and
 nothing about the rest of the build. Verify the rest past the gate as above.
-The Worker serves that card only while its bytes hash to the sha256 the
-manifest and the stored preview carry. Right after a republish that changes the
-card, KV can lag for about a minute: the unauthenticated `og.png` then gets the
-login page, and the page has no preview tags. That is the check working, not a
-failed publish. Retry after a minute.
+The Worker serves that card only while its bytes hash to the sha256 that the
+manifest's preview record and its `og.png` row carry. The preview is part of
+the manifest, so it changes with the manifest write, with no KV delay. The CLI
+uploads to R2 before it writes the manifest. So while a republish that changes
+the card is in flight, the unauthenticated `og.png` gets the login page. That
+is the check working, not a failed publish; check again once the publish
+returns.
 
 ## View tracking
 
@@ -377,17 +379,28 @@ drop --public-preview --card-title "Project proposal" --yes site/
 
 - The login page then carries the preview tags, and exactly one file loads
   without the password: the generated card at `<slug>/og.png`. Every other path
-  still needs the password.
+  still needs the password. `--card-site-name` and `--card-image-alt` carry
+  through to `og:site_name`, `og:image:alt` and `twitter:image:alt`, with the
+  same values as the staged page.
+- **The preview is part of the published manifest.** The Worker stores it in
+  the share's D1 row, written with the manifest. The next publish without the
+  flag turns it off in that same write.
 - **Only the exact card bytes load.** The manifest carries the card's sha256,
-  and the Worker serves `og.png` without the password only while the manifest,
-  the stored preview, and the R2 bytes all agree. A stale preview key or an R2
+  and the Worker serves `og.png` without the password only while the preview
+  record, the manifest's `og.png` row, and the R2 bytes all agree. An R2
   overwrite gets the login page, never new bytes.
-- The card draws only plain ASCII, in at most five lines. With this flag the
-  CLI warns when the title has other characters (they show as `?`) or is too
-  long. Pass an ASCII `--card-title` that fits, so the card matches `og:title`.
-- **What becomes public:** the card title, the description, and the `og.png`
-  card. Anyone who knows or guesses the slug sees them, and password slugs are
-  readable words. Put nothing secret in the title or description.
+- **The card title must be plain ASCII and fit.** The card draws only printable
+  ASCII, in at most five lines. With this flag the CLI refuses a title with
+  other characters (they would show as `?`) or one that would be clipped. Pass
+  an ASCII `--card-title`, or a shorter one.
+- **The public values get a PII scan.** Before the publish prompt, the CLI scans
+  the final title, description, site name and alt text, after HTML entity
+  decoding, with the preflight's PII scan. A high-confidence finding blocks the
+  publish unless `--allow-pii REASON`, which is logged as a `preview-pii`
+  override.
+- **What becomes public:** the card title, the description, the site name, the
+  alt text, and the `og.png` card. Anyone who knows or guesses the slug sees
+  them, and password slugs are readable words. Put nothing secret in them.
 - **It is not inherited.** A republish with `drop update` or `--slug` turns it
   off unless you pass `--public-preview` again.
 - The CLI refuses it with `--public`/`--unlisted` (those already preview), with
