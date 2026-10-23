@@ -1352,6 +1352,23 @@ def share_expired(row: dict, now: dt.datetime | None = None) -> bool:
     return bool(expires) and parse_iso(expires) <= (now or utc_now())
 
 
+VISIBILITIES = ("password", "unlisted", "public")
+
+
+def share_visibility(row: dict) -> str | None:
+    """The tier this CLI recorded for a share when it published it, or None for a
+    row published before the CLI recorded one.
+
+    The Worker can't answer this itself: unlisted and public are both
+    auth_mode="public" there. So the CLI writes its tier into the manifest's
+    scan_result, which the Worker stores verbatim and /admin/list returns. A
+    recorded tier is fact; the slug shape (looks_unlisted) is only a fallback for
+    older rows."""
+    scan = row.get("scan_result")
+    value = scan.get("visibility") if isinstance(scan, dict) else None
+    return value if value in VISIBILITIES else None
+
+
 def check_unlisted_republish(slug: str, row: dict | None) -> None:
     """Allow --slug with --unlisted only onto a live share that is already
     unlisted. Anything else would pass off a guessable URL as a secret link, or
@@ -1378,6 +1395,15 @@ def check_unlisted_republish(slug: str, row: dict | None) -> None:
         )
     if mode != "public":
         raise PublishError(f"{slug} has an unknown auth_mode {mode!r}; refusing to guess its tier")
+    recorded = share_visibility(row)
+    if recorded == "unlisted":
+        return
+    if recorded is not None:
+        raise PublishError(
+            f"{slug} was published as a {recorded} share, so --unlisted would not make it secret; "
+            f"republish it with `drop update {slug} <path>`, or drop --slug to mint a new unlisted link"
+        )
+    # No recorded tier (published before the CLI kept one): fall back to the slug shape.
     if not looks_unlisted(slug):
         raise PublishError(
             f"{slug} is a public share with no unguessable tail, so --unlisted would not make it secret; "
@@ -1465,6 +1491,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
         expires_at=expires_at,
         token=token,
         notes=notes,
+        visibility="unlisted" if args.unlisted else "public" if args.public else "password",
     )
 
 
@@ -1496,6 +1523,10 @@ def cmd_update(slug: str, args: argparse.Namespace) -> None:
         expires_at=expires_at,
         token=token,
         notes=[],
+        # Carry the recorded tier over. An older no-password row has none, and
+        # update does not guess one from the slug: an unrecorded tier stays
+        # unrecorded rather than turning a heuristic into a fact.
+        visibility=share_visibility(row) or ("password" if row["auth_mode"] == "password" else None),
     )
 
 
@@ -1507,6 +1538,7 @@ def publish_artifact(
     expires_at: str | None,
     token: str | None,
     notes: list[str],
+    visibility: str | None,
 ) -> None:
     """The one publish path behind both `drop <path>` and `drop update`: scan,
     stage, upload, write the manifest, and (for a republish) purge stale files.
@@ -1516,6 +1548,21 @@ def publish_artifact(
     has already settled the tier, password, and expiry."""
     path = Path(args.path).expanduser().resolve()
     files = iter_files(path)
+    if not args.no_card and not _html_files(files):
+        # The preview lives in og: meta inside an HTML page. With no HTML there is
+        # nowhere to put it, so these would be silently ignored.
+        used = [
+            flag
+            for flag, value in (
+                ("--card-image", args.card_image),
+                ("--card-description", args.card_description),
+                ("--card-site-name", args.card_site_name),
+                ("--card-image-alt", args.card_image_alt),
+            )
+            if value
+        ]
+        if used:
+            raise PublishError(f"{', '.join(used)} needs an HTML page to carry the preview, and {path.name} has none")
     # An external --card-image is published too, so it gets the same filename,
     # PII, and OCR scans as the artifact's own files. (Only when there is HTML
     # to carry the preview; otherwise nothing is staged and nothing uploads.)
@@ -1525,6 +1572,8 @@ def publish_artifact(
         if external:
             scanned = files + [(source, source.name)]
     scan_result = preflight(path, scanned, args)
+    if visibility:
+        scan_result["visibility"] = visibility
     public_confirm(args)
 
     in_place = bool(args.slug)
@@ -1588,7 +1637,22 @@ def publish_artifact(
     # (resolve_unique_slug saw no row), so its prefix held nothing to begin with.
     purged = 0
     if in_place:
-        purged, purge_warning = purge_stale_objects(slug, {rel for _, rel in published})
+        # Two republishes of one slug can overlap. If another one's manifest
+        # landed after ours, its files are live and ours are the stale ones, so a
+        # purge from here would delete the winner's bytes. Purge only while the
+        # live row still carries this publish's digest. (This narrows the race to
+        # the purge itself; closing it fully needs a conditional write on the
+        # Worker.)
+        try:
+            live = lookup_share(slug, token)
+        except PublishError as err:
+            live, purge_warning = None, f"stale-file purge skipped: could not re-read {slug}: {err}"
+        else:
+            purge_warning = None if live else f"stale-file purge skipped: {slug} is missing from /admin/list"
+        if live and live.get("sha256") != artifact_sha:
+            live, purge_warning = None, f"stale-file purge skipped: a newer publish has landed on {slug}"
+        if live:
+            purged, purge_warning = purge_stale_objects(slug, {rel for _, rel in published})
         if purge_warning:
             notes.append(purge_warning)
 

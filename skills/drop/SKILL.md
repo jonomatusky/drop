@@ -158,11 +158,16 @@ Four things to know before rerunning a republish:
   password, and a slug ending in the 16-character random tail. The CLI refuses an
   unknown slug (a hand-picked slug has no unguessable tail), a password share (it
   would lose its password), a public slug with no tail (it would stay guessable),
-  and a revoked or expired share.
+  and a revoked or expired share. Every publish now records its tier in the
+  manifest's `scan_result.visibility`, and the CLI trusts that record over the
+  slug shape. Only rows published before that record existed fall back to the
+  shape check: a 16-character tail with at least one digit.
 
 After the manifest lands, a republish lists the slug's prefix in R2 and deletes
 every file the new build no longer has. It prints `purged: N stale files` when it
-removed any. A purge failure is a warning on stderr, not a failed publish: the
+removed any. It first re-reads the share and skips the purge if the live digest
+is no longer this publish's, so an overlapping republish never loses its files.
+A purge failure is a warning on stderr, not a failed publish: the
 share is already live, and the leftovers don't serve anyway, because the Worker
 gates every request against the current manifest's file list.
 
@@ -338,8 +343,8 @@ drop --unlisted --card-image hero.jpg --card-description "Ten days in Tokyo" \
 - `--card-description` replaces the page's meta description, `--card-site-name`
   sets `og:site_name`, and `--card-image-alt` sets `og:image:alt` and
   `twitter:image:alt`. Each tag is written only when you pass its flag.
-- The CLI refuses a flag it would ignore: any of those four with `--no-card`, and
-  the color flags with `--card-image`.
+- The CLI refuses a flag it would ignore: any of those four with `--no-card` or
+  on an artifact with no HTML page, and the color flags with `--card-image`.
 - The `card:` line in the output (and `card.image` in a dry run) is the image URL
   actually used.
 

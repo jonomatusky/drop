@@ -126,10 +126,11 @@ def list_xml(keys, token=None, ns=S3_NS):
     ).encode()
 
 
-def row(slug, auth_mode="public", label=None, expires_at=None, revoked_at=None):
+def row(slug, auth_mode="public", label=None, expires_at=None, revoked_at=None, visibility=None):
     return {
         "slug": slug, "label": label, "auth_mode": auth_mode, "expires_at": expires_at,
         "revoked_at": revoked_at, "created_at": PAST, "files": [], "bytes": 1, "views": 0,
+        "scan_result": {"status": "passed", **({"visibility": visibility} if visibility else {})},
     }
 
 
@@ -152,6 +153,10 @@ class Fake:
             return {"shares": self.rows}
         if path == "/admin/manifest":
             self.manifests.append(payload)
+            # Upsert like the Worker, so a later /admin/list sees this publish.
+            live = {**row(payload["slug"], payload["auth_mode"], payload.get("label"), payload.get("expires_at")),
+                    "sha256": payload["sha256"], "scan_result": payload["scan_result"]}
+            self.rows = [r for r in self.rows if r.get("slug") != payload["slug"]] + [live]
             return {"ok": True, "slug": payload["slug"]}
         raise AssertionError(f"unexpected admin call {method} {path}")
 
@@ -261,8 +266,10 @@ def test_unlisted_slug_allowed_for_live_unlisted_share():
     # The lookup comes first: before the preflight, and so before any upload.
     assert fake.events[0] == ("admin", "GET", "/admin/list"), fake.events
     assert fake.index("admin") < fake.index("preflight") < fake.index("upload"), fake.events
-    # Exactly one list call — the lookup. No clash resolver ran.
-    assert sum(1 for e in fake.events if e == ("admin", "GET", "/admin/list")) == 1, fake.events
+    # Before the upload, exactly one list call — the lookup; no clash resolver
+    # ran. (The one after the manifest is the purge's re-read of the live row.)
+    before_upload = fake.events[: fake.index("upload")]
+    assert sum(1 for e in before_upload if e == ("admin", "GET", "/admin/list")) == 1, fake.events
     assert f"url: https://drop.example.com/{UNLISTED}/" in out, out
     assert "password:" not in out, out
 
@@ -604,6 +611,114 @@ def test_purge_skipped_in_dry_run():
     code, out, err = run_cli(["--public", "--slug", "demo", "--dry-run", "--yes", str(PAGE)], fake)
     assert code == 0, err
     assert "s3" not in fake.kinds(), fake.events
+
+
+# --- Recorded tier (scan_result.visibility) ------------------------------------
+
+
+def test_publish_records_its_tier():
+    for flags, expected in (([], "password"), (["--public"], "public"), (["--unlisted"], "unlisted")):
+        fake = Fake()
+        code, out, err = run_cli([*flags, "--yes", str(PAGE)], fake)
+        assert code == 0, err
+        assert fake.manifests[0]["scan_result"]["visibility"] == expected, (flags, fake.manifests[0]["scan_result"])
+
+
+def test_unlisted_slug_trusts_a_recorded_unlisted_tier_over_the_shape():
+    # A real generated tail can be all letters (~1 in 180). A recorded tier wins.
+    slug = "acme-kfmqxpntzrwvbhdj"
+    assert not drop.looks_unlisted(slug)
+    fake = Fake(rows=[row(slug, visibility="unlisted")])
+    code, out, err = run_cli(["--unlisted", "--slug", slug, "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert fake.manifests[0]["scan_result"]["visibility"] == "unlisted"
+
+
+def test_unlisted_slug_refused_for_recorded_public_share_even_with_a_tail_shape():
+    # A hand-picked public slug can look like a tail (`report2026finalx`); the
+    # recorded tier says it is guessable, so the shape must not bless it.
+    slug = "acme-report2026finalx"
+    assert drop.looks_unlisted(slug)
+    refused(["--unlisted", "--slug", slug, "--yes", str(PAGE)], Fake(rows=[row(slug, visibility="public")]),
+            "was published as a public share")
+
+
+def test_update_carries_the_recorded_tier():
+    fake = Fake(rows=[row(UNLISTED, visibility="unlisted")])
+    code, out, err = run_cli(["update", UNLISTED, "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert fake.manifests[0]["scan_result"]["visibility"] == "unlisted"
+
+
+def test_update_does_not_invent_a_tier_for_an_old_row():
+    fake = Fake(rows=[row(UNLISTED)])
+    code, out, err = run_cli(["update", UNLISTED, "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert "visibility" not in fake.manifests[0]["scan_result"], fake.manifests[0]["scan_result"]
+
+
+def test_update_records_password_tier_for_an_old_password_row():
+    fake = Fake(rows=[row("deck", auth_mode="password")])
+    code, out, err = run_cli(["update", "deck", "--password", "hunter22hunter22", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert fake.manifests[0]["scan_result"]["visibility"] == "password"
+
+
+# --- Purge vs. an overlapping republish ----------------------------------------
+
+
+def test_purge_skipped_when_a_newer_publish_landed():
+    class Racing(Fake):
+        def admin_request(self, method, path, token, payload=None):
+            result = super().admin_request(method, path, token, payload)
+            if path == "/admin/manifest":
+                # Another republish's manifest lands right after ours.
+                for r in self.rows:
+                    if r["slug"] == payload["slug"]:
+                        r["sha256"] = "someone-elses-digest"
+            return result
+
+    fake = Racing(rows=[row("demo")], bucket_keys=["demo/index.html", "demo/og.png", "demo/theirs.css"])
+    code, out, err = run_cli(["--public", "--slug", "demo", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert "s3" not in fake.kinds(), fake.events  # nothing listed, nothing deleted
+    assert "a newer publish has landed on demo" in err, err
+
+
+def test_purge_skipped_when_the_reread_fails():
+    class Flaky(Fake):
+        def admin_request(self, method, path, token, payload=None):
+            if path == "/admin/list" and self.manifests:
+                raise drop.PublishError("admin API unavailable: timed out")
+            return super().admin_request(method, path, token, payload)
+
+    fake = Flaky(rows=[row("demo")], bucket_keys=["demo/stale.css"])
+    code, out, err = run_cli(["--public", "--slug", "demo", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert "s3" not in fake.kinds() and "could not re-read demo" in err, (fake.events, err)
+
+
+# --- Preview flags need HTML ----------------------------------------------------
+
+
+def test_new_card_flags_refused_without_html():
+    pdf = Path(_ARTIFACTS.name) / "deck.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    for flag, value in (("--card-description", "d"), ("--card-site-name", "s"), ("--card-image-alt", "a"),
+                        ("--card-image", str(Path(__file__).resolve()))):
+        if flag == "--card-image":
+            img = Path(_ARTIFACTS.name) / "hero.png"
+            img.write_bytes(b"\x89PNG\r\n\x1a\n")
+            value = str(img)
+        refused(["--public", flag, value, "--yes", str(pdf)], Fake(), "needs an HTML page")
+
+
+def test_old_card_flags_still_tolerated_without_html():
+    pdf = Path(_ARTIFACTS.name) / "deck.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    fake = Fake()
+    code, out, err = run_cli(["--public", "--card-title", "T", "--yes", str(pdf)], fake)
+    assert code == 0, err
 
 
 def main():

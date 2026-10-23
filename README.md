@@ -137,13 +137,17 @@ starting alphanumeric, otherwise `[a-z0-9._-]`) publishes a share whose own URL
 `--slug` with `--unlisted` works only onto a live share that is already
 unlisted: no password, and a slug ending in the 16-character random tail. A new
 hand-picked slug has no tail, a password share would lose its password, and a
-public slug would stay guessable, so each of those is refused.
+public slug would stay guessable, so each of those is refused. Each publish
+records its tier in the manifest (`scan_result.visibility`), and that record
+beats the slug shape. Older rows without one fall back to the shape: a
+16-character tail with at least one digit.
 
 Both forms look up the share before the preflight, even with `--dry-run`, so
 they need the admin token.
 
 After the new manifest lands, a republish deletes the files the new build
-dropped and prints `purged: N stale files`. A failed purge is only a warning,
+dropped and prints `purged: N stale files`. It skips the purge if the live
+digest has changed since its own manifest landed (another republish won). A failed purge is only a warning,
 because the share is already live; the leftovers don't serve either way, since
 the Worker gates every request against the current manifest's file list. And
 never fake an update by grafting a temp slug's manifest onto a stable one via
@@ -218,7 +222,8 @@ drop --public --card-image hero.jpg \
 - `--card-description` replaces the page's meta description. `--card-site-name`
   sets `og:site_name`, and `--card-image-alt` sets the image alt text. Each tag is
   written only when you pass its flag.
-- The CLI refuses a flag it would ignore: any of these with `--no-card`, and
+- The CLI refuses a flag it would ignore: any of these with `--no-card` or on an
+  artifact with no HTML page, and
   `--card-bg`/`--card-fg`/`--card-accent` with `--card-image`.
 
 The renderer is **pure Python stdlib** — a small `zlib`/`struct` PNG encoder and
