@@ -25,16 +25,20 @@ async function verifier(password, iterations = 1000) {
 class KV {
   constructor(seed = {}) {
     this.map = new Map(Object.entries(seed));
+    this.puts = [];
+    this.deletes = [];
   }
   async get(key, opts = {}) {
     const value = this.map.get(key);
     if (value === undefined) return null;
     return opts.type === "json" ? JSON.parse(value) : value;
   }
-  async put(key, value) {
+  async put(key, value, options) {
+    this.puts.push({ key, value, options });
     this.map.set(key, value);
   }
   async delete(key) {
+    this.deletes.push(key);
     this.map.delete(key);
   }
 }
@@ -165,8 +169,143 @@ async function envFor(rows, kvSeed = {}) {
   };
 }
 
+function manifestPayload(overrides = {}) {
+  return {
+    slug: "s1",
+    auth_mode: "password",
+    sha256: "updated-sha",
+    files: [{ path: "index.html", bytes: 2, sha256: "updated-sha" }],
+    bytes: 2,
+    scan_result: { clean: true },
+    created_at: "2026-10-23T00:00:00+00:00",
+    uploader: "test-publisher",
+    ...overrides,
+  };
+}
+
+function manifestRequest(payload) {
+  return new Request("https://share.example.test/admin/manifest", {
+    method: "POST",
+    headers: { authorization: "Bearer admin", "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
 const auth = `Basic ${Buffer.from("user:pw").toString("base64")}`;
 const badAuth = `Basic ${Buffer.from("user:wrong").toString("base64")}`;
+
+// === Manifest republish: retain an existing password verifier ===
+
+{
+  const oldVerifier = await verifier("pw");
+  const serializedVerifier = JSON.stringify(oldVerifier);
+  const env = await envFor(
+    { s1: row("s1") },
+    { "auth:s1": serializedVerifier, "deny:s1": "1" },
+  );
+  const oldCookie = await shareCookieToken(env, "s1", oldVerifier);
+
+  const res = await fetchHandler(manifestRequest(manifestPayload({ keep_password_verifier: true })), env);
+  assert.equal(res.status, 200);
+  assert.equal(env.AUTH_KV.map.get("auth:s1"), serializedVerifier, "the existing verifier remains byte-for-byte unchanged");
+  assert.equal(
+    env.AUTH_KV.puts.filter(({ key }) => key === "auth:s1").length,
+    0,
+    "the keep path must not rewrite the verifier",
+  );
+  assert.equal(env.AUTH_KV.map.has("deny:s1"), false, "successful republish still clears the deny marker");
+
+  const publish = env.DB.audit.find((event) => event.event === "publish");
+  assert.ok(publish, "successful republish still writes the publish audit event");
+  assert.deepEqual(JSON.parse(publish.details_json), {
+    auth_mode: "password",
+    bytes: 2,
+    files: ["index.html"],
+    scan_result: { clean: true },
+    override_log: [],
+    kept_password_verifier: true,
+  }, "the existing audit details are preserved and the keep path is marked");
+
+  const followup = await fetchHandler(
+    new Request("https://share.example.test/s1/", { headers: { cookie: `drop_auth=${oldCookie}` } }),
+    env,
+  );
+  assert.equal(followup.status, 200);
+  assert.equal(await followup.text(), "<h1>ok</h1>", "a cookie bound to the retained verifier remains valid");
+}
+
+{
+  const existingVerifier = JSON.stringify(await verifier("pw"));
+  const refusalCases = [
+    {
+      name: "existing public share",
+      rows: { s1: row("s1", { auth_mode: "public" }) },
+      kv: { "auth:s1": existingVerifier, "deny:s1": "1" },
+    },
+    {
+      name: "missing D1 row",
+      rows: {},
+      kv: { "auth:s1": existingVerifier, "deny:s1": "1" },
+    },
+    {
+      name: "missing KV verifier",
+      rows: { s1: row("s1") },
+      kv: { "deny:s1": "1" },
+    },
+  ];
+
+  for (const testCase of refusalCases) {
+    const env = await envFor(testCase.rows, testCase.kv);
+    const res = await fetchHandler(manifestRequest(manifestPayload({ keep_password_verifier: true })), env);
+    assert.equal(res.status, 400, testCase.name);
+    assert.equal(await res.text(), "no existing password to keep\n", testCase.name);
+    assert.equal(env.AUTH_KV.map.get("deny:s1"), "1", `${testCase.name}: refusal leaves deny state unchanged`);
+    assert.equal(env.DB.audit.length, 0, `${testCase.name}: refusal writes no audit event`);
+  }
+}
+
+{
+  const env = await envFor({ s1: row("s1") }, { "deny:s1": "1" });
+  const res = await fetchHandler(manifestRequest(manifestPayload()), env);
+  assert.equal(res.status, 400);
+  assert.equal(await res.text(), "missing password_verifier\n", "the existing missing-verifier error is unchanged without the keep flag");
+  assert.equal(env.AUTH_KV.map.get("deny:s1"), "1");
+  assert.equal(env.DB.audit.length, 0);
+}
+
+{
+  const newVerifier = await verifier("new-password");
+  const env = await envFor(
+    { s1: row("s1", { auth_mode: "public" }) },
+    { "auth:s1": JSON.stringify(await verifier("old-password")), "deny:s1": "1" },
+  );
+  const res = await fetchHandler(manifestRequest(manifestPayload({
+    keep_password_verifier: true,
+    password_verifier: newVerifier,
+  })), env);
+  assert.equal(res.status, 200, "a supplied verifier takes precedence over the keep flag");
+  assert.equal(env.AUTH_KV.map.get("auth:s1"), JSON.stringify(newVerifier));
+  assert.equal(env.AUTH_KV.puts.filter(({ key }) => key === "auth:s1").length, 1);
+  assert.equal(env.AUTH_KV.map.has("deny:s1"), false);
+  const details = JSON.parse(env.DB.audit.find((event) => event.event === "publish").details_json);
+  assert.equal(Object.hasOwn(details, "kept_password_verifier"), false, "audit marks only the actual keep path");
+}
+
+{
+  const env = await envFor(
+    { s1: row("s1", { auth_mode: "public" }) },
+    { "auth:s1": JSON.stringify(await verifier("old-password")), "deny:s1": "1" },
+  );
+  const res = await fetchHandler(manifestRequest(manifestPayload({
+    auth_mode: "public",
+    keep_password_verifier: true,
+  })), env);
+  assert.equal(res.status, 200, "public publishing behavior is unchanged when the irrelevant flag is present");
+  assert.equal(env.AUTH_KV.map.has("auth:s1"), false);
+  assert.equal(env.AUTH_KV.map.has("deny:s1"), false);
+  const details = JSON.parse(env.DB.audit.find((event) => event.event === "publish").details_json);
+  assert.equal(Object.hasOwn(details, "kept_password_verifier"), false);
+}
 
 {
   const env = await envFor({ s1: row("s1") }, { "auth:s1": JSON.stringify(await verifier("pw")) });

@@ -548,7 +548,21 @@ async function upsertManifest(request, env) {
   }
   if (!["password", "public"].includes(payload.auth_mode)) return badRequest("invalid auth_mode");
   if (!Array.isArray(payload.files) || payload.files.length === 0) return badRequest("files must be a non-empty array");
-  if (payload.auth_mode === "password" && !payload.password_verifier) return badRequest("missing password_verifier");
+
+  let keptPasswordVerifier = false;
+  if (payload.auth_mode === "password" && !payload.password_verifier) {
+    if (payload.keep_password_verifier !== true) return badRequest("missing password_verifier");
+    const existingShare = await env.DB.prepare(
+      "SELECT auth_mode FROM shares WHERE slug = ?",
+    ).bind(payload.slug).first();
+    const existingVerifier = existingShare?.auth_mode === "password"
+      ? await env.AUTH_KV.get(`auth:${payload.slug}`)
+      : null;
+    if (!existingShare || existingShare.auth_mode !== "password" || existingVerifier === null) {
+      return badRequest("no existing password to keep");
+    }
+    keptPasswordVerifier = true;
+  }
 
   await env.DB.prepare(
     `INSERT INTO shares (slug, label, auth_mode, sha256, files_json, bytes, scan_result_json, created_at, expires_at, revoked_at, uploader)
@@ -576,19 +590,21 @@ async function upsertManifest(request, env) {
     payload.uploader,
   ).run();
 
-  if (payload.auth_mode === "password") {
+  if (payload.auth_mode === "password" && !keptPasswordVerifier) {
     await env.AUTH_KV.put(`auth:${payload.slug}`, JSON.stringify(payload.password_verifier));
-  } else {
+  } else if (payload.auth_mode === "public") {
     await env.AUTH_KV.delete(`auth:${payload.slug}`);
   }
   await env.AUTH_KV.delete(`deny:${payload.slug}`);
-  await recordAudit(env, payload.slug, "publish", payload.uploader, {
+  const auditDetails = {
     auth_mode: payload.auth_mode,
     bytes: payload.bytes,
     files: payload.files.map((file) => file.path),
     scan_result: payload.scan_result,
     override_log: payload.override_log || [],
-  });
+  };
+  if (keptPasswordVerifier) auditDetails.kept_password_verifier = true;
+  await recordAudit(env, payload.slug, "publish", payload.uploader, auditDetails);
 
   return json({ ok: true, slug: payload.slug });
 }
