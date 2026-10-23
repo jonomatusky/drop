@@ -381,7 +381,7 @@ def public_confirm(args: argparse.Namespace) -> None:
     if args.yes:
         return
     preview = (
-        "Its link preview (title, description and card image) is viewable by anyone "
+        "Its link preview (title, description, site name, image alt text and card image) is viewable by anyone "
         "with the link, without the password. "
         if getattr(args, "public_preview", False)
         else ""
@@ -1888,7 +1888,7 @@ def publish_artifact(
     if card_note:
         print(f"card: {card_note['image']}")
     if args.public_preview:
-        print("preview: public (title, description and og.png load without the password)")
+        print("preview: public (title, description, site name, alt text and og.png load without the password)")
     if password:
         print(f"password: {password}")
     if expires_at:

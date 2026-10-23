@@ -873,7 +873,7 @@ def test_public_preview_output_line():
     code, out, err = run_cli(["--public-preview", "--yes", str(PAGE)], fake)
     assert code == 0, err
     lines = out.splitlines()
-    preview_line = "preview: public (title, description and og.png load without the password)"
+    preview_line = "preview: public (title, description, site name, alt text and og.png load without the password)"
     assert preview_line in lines, out
     assert lines.index(preview_line) > next(i for i, line in enumerate(lines) if line.startswith("card: ")), out
 
@@ -1114,7 +1114,7 @@ def test_confirmation_mentions_the_public_preview():
         sys.stdin = saved_stdin
         del drop.input
     with_preview, without = prompts
-    assert "link preview (title, description and card image)" in with_preview, with_preview
+    assert "link preview (title, description, site name, image alt text and card image)" in with_preview, with_preview
     assert "anyone with the link, without the password" in with_preview, with_preview
     assert with_preview.endswith("Type 'publish' to continue: "), with_preview
     assert "preview" not in without and "without the password" not in without, without
