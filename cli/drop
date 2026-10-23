@@ -380,9 +380,15 @@ def scan_images(files: list[tuple[Path, str]], confirm_limitation: bool) -> tupl
 def public_confirm(args: argparse.Namespace) -> None:
     if args.yes:
         return
+    preview = (
+        "Its link preview (title, description and card image) is viewable by anyone "
+        "with the link, without the password. "
+        if getattr(args, "public_preview", False)
+        else ""
+    )
     prompt = (
         "This artifact goes on the public internet. It may be cached, indexed, "
-        "forwarded, and survive deletion. Type 'publish' to continue: "
+        f"forwarded, and survive deletion. {preview}Type 'publish' to continue: "
     )
     if not sys.stdin.isatty():
         raise PublishError("refusing non-interactive publish without --yes")
@@ -904,6 +910,10 @@ def render_og_card(
 
 _OG_BLOCK_START = "<!-- drop:og -->"
 _OG_BLOCK_END = "<!-- /drop:og -->"
+# The page's og:/twitter: description is cut to this many characters.
+OG_DESCRIPTION_MAX = 300
+# The Worker's cap on a --public-preview title (see validatePreview there).
+PREVIEW_TITLE_MAX = 300
 
 
 def _esc_attr(value: str) -> str:
@@ -975,7 +985,7 @@ def inject_og_meta(
     if image_alt:
         tags.append(f'<meta name="twitter:image:alt" content="{_esc_attr(image_alt)}">')
     if description:
-        desc = _esc_attr(description[:300])
+        desc = _esc_attr(description[:OG_DESCRIPTION_MAX])
         tags.insert(2, f'<meta property="og:description" content="{desc}">')
         tags.append(f'<meta name="twitter:description" content="{desc}">')
     block = _OG_BLOCK_START + "\n" + "\n".join(tags) + "\n" + _OG_BLOCK_END + "\n"
@@ -1142,6 +1152,15 @@ def check_card_flags(args: argparse.Namespace) -> None:
     they asked for."""
     for value in (args.card_bg, args.card_fg, args.card_accent):
         _parse_hex_color(value, None)
+    if getattr(args, "public_preview", False):
+        if args.no_card:
+            raise PublishError("--public-preview shows the link-preview card, and --no-card turns it off; drop one")
+        if args.card_image:
+            # A deliberate limit: a custom image is often a photo, and this flag
+            # would serve it to anyone with the link.
+            raise PublishError(
+                "--public-preview exposes only the generated title card; --card-image is not supported with it yet"
+            )
     if args.no_card:
         used = [
             flag
@@ -1171,6 +1190,38 @@ def check_card_flags(args: argparse.Namespace) -> None:
             raise PublishError(f"--card-image must be one of {allowed}: {args.card_image}")
         if not image.is_file():
             raise PublishError(f"--card-image not found: {args.card_image}")
+
+
+def check_public_preview_tier(auth_mode: str, args: argparse.Namespace, slug: str | None = None) -> None:
+    """--public-preview only means something on a password share: the other
+    tiers serve the whole share, card included, to anyone with the link."""
+    if not args.public_preview or auth_mode == "password":
+        return
+    if slug:
+        raise PublishError(
+            f"{slug} has no password, so its link preview is already public; drop --public-preview"
+        )
+    raise PublishError(
+        "--public-preview is for password shares; --public and --unlisted shares already show "
+        "their link preview to anyone with the link; drop one"
+    )
+
+
+def preview_payload(card_note: dict | None) -> dict:
+    """The manifest's `preview` for --public-preview: the exact title and
+    description the staged card carries. Checked against the Worker's limits
+    here, so a bad value fails before anything uploads."""
+    if not card_note or card_note.get("image_source") != "generated":
+        raise PublishError("--public-preview needs the generated og.png card, and none was staged")
+    title = card_note["title"]
+    if not title.strip():
+        raise PublishError("--public-preview needs a card title; pass --card-title")
+    if len(title) > PREVIEW_TITLE_MAX:
+        raise PublishError(
+            f"--public-preview: the card title is {len(title)} characters and the limit is "
+            f"{PREVIEW_TITLE_MAX}; pass a shorter --card-title"
+        )
+    return {"title": title, "description": card_note.get("description")}
 
 
 def resolve_card_image(image_arg: str, files: list[tuple[Path, str]]) -> tuple[Path, str, bool]:
@@ -1252,7 +1303,14 @@ def stage_publish_set(
             "image_alt": args.card_image_alt,
             "site_name": args.card_site_name,
         }
-        note = {"title": title, "image": image_url, "image_source": image_source, "entry": entry}
+        note = {
+            "title": title,
+            # As the page's og:description carries it; --public-preview sends this.
+            "description": description[:OG_DESCRIPTION_MAX] if description else None,
+            "image": image_url,
+            "image_source": image_source,
+            "entry": entry,
+        }
 
     # A single HTML file is the share's entry page: stage it as index.html so the
     # bare `/<slug>/` URL serves it (the Worker's single-file root fallback no
@@ -1460,6 +1518,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
     # isn't. (--public/--unlisted are already mutually exclusive via argparse.)
     if (args.public or args.unlisted) and args.password:
         raise PublishError("--password has no effect on --public/--unlisted shares (those tiers have no password); drop one")
+    check_public_preview_tier("public" if (args.public or args.unlisted) else "password", args)
     check_card_flags(args)
 
     # Three visibility tiers (YouTube-style):
@@ -1509,6 +1568,9 @@ def cmd_update(slug: str, args: argparse.Namespace) -> None:
     row = lookup_share(slug, token)
     check_update_target(slug, row, args)
     assert row is not None  # check_update_target raised otherwise
+    # The preview is not inherited: like the card itself, it is set per publish,
+    # so an update without --public-preview turns it off.
+    check_public_preview_tier(row["auth_mode"], args, slug)
     if not (args.client or args.label) and row.get("label"):
         # Also feeds the card title fallback, the same as a passed --label would.
         args.label = row["label"]
@@ -1558,11 +1620,19 @@ def publish_artifact(
                 ("--card-description", args.card_description),
                 ("--card-site-name", args.card_site_name),
                 ("--card-image-alt", args.card_image_alt),
+                ("--public-preview", args.public_preview),
             )
             if value
         ]
         if used:
             raise PublishError(f"{', '.join(used)} needs an HTML page to carry the preview, and {path.name} has none")
+    if args.public_preview and any(rel == "og.png" for _, rel in files):
+        # The generated card is staged at og.png, the one path the Worker serves
+        # without the password. Refuse rather than let the artifact's own file
+        # and the card fight over that name.
+        raise PublishError(
+            f"--public-preview serves the generated card at og.png, and {path.name} already has an og.png; rename it"
+        )
     # An external --card-image is published too, so it gets the same filename,
     # PII, and OCR scans as the artifact's own files. (Only when there is HTML
     # to carry the preview; otherwise nothing is staged and nothing uploads.)
@@ -1622,6 +1692,8 @@ def publish_artifact(
         }
         if password:
             manifest["password_verifier"] = password_verifier(password)
+        if args.public_preview:
+            manifest["preview"] = preview_payload(card_note)
 
         if args.dry_run:
             print(json.dumps({"dry_run": True, "url": f"{base}/{slug}/", "card": card_note, "manifest": manifest}, indent=2))
@@ -1659,6 +1731,8 @@ def publish_artifact(
     print(f"url: {base}/{slug}/")
     if card_note:
         print(f"card: {card_note['image']}")
+    if args.public_preview:
+        print("preview: public (title, description and og.png load without the password)")
     if password:
         print(f"password: {password}")
     if expires_at:
@@ -1768,6 +1842,12 @@ def build_parser(prog: str = "drop") -> argparse.ArgumentParser:
     parser.add_argument("--card-image-alt", metavar="TEXT", help="alt text for the preview image (og:image:alt, twitter:image:alt)")
     parser.add_argument("--card-site-name", metavar="TEXT", help="site name shown with the preview (og:site_name)")
     parser.add_argument("--no-card", action="store_true", help="do not generate a link-preview card or inject preview meta tags")
+    parser.add_argument(
+        "--public-preview",
+        action="store_true",
+        help="password shares only: show the link-preview card (title, description, generated og.png) to anyone "
+        "with the link, without the password; not kept on republish unless passed again",
+    )
     # Republish: an exact slug skips the clash resolver, so the bytes land on that
     # slug's own prefix and the manifest row is upserted in place. The row is
     # looked up (for expiry, and for --unlisted's checks) but a slug with no row is

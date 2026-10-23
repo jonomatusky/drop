@@ -421,5 +421,42 @@ with tempfile.TemporaryDirectory() as outside:
     drop.check_card_flags(ok_args)
     check("--card-image with title and alt is accepted", True)
     check("colors alone still accepted", not refused_flags(["--card-bg", "#000000"], ""))
+    check("--public-preview refused with --no-card", refused_flags(["--public-preview", "--no-card"], "--no-card"))
+    check("--public-preview refused with --card-image",
+          refused_flags(["--public-preview", "--card-image", str(img)], "only the generated title card"))
+    check("--public-preview with card text and colors accepted",
+          not refused_flags(["--public-preview", "--card-title", "T", "--card-description", "d", "--card-bg", "#000000"], ""))
+
+print("public preview payload (preview_payload)")
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d)
+    (root / "index.html").write_text('<html><head><title>Doc</title><meta name="description" content="Page desc"></head></html>')
+    files = [(root / "index.html", "index.html")]
+    staged, tmp, note, _ = drop.stage_publish_set(files, "s", "https://drop.example.com", _Args())
+    try:
+        check("card note carries the page description", note["description"] == "Page desc")
+        check("preview payload is the note's title and description",
+              drop.preview_payload(note) == {"title": "Doc", "description": "Page desc"})
+    finally:
+        tmp.cleanup()
+    staged, tmp, note, _ = drop.stage_publish_set(files, "s", "https://drop.example.com", card_args(card_title="T", card_description="D"))
+    try:
+        check("overrides reach the preview payload", drop.preview_payload(note) == {"title": "T", "description": "D"})
+    finally:
+        tmp.cleanup()
+
+    def payload_refused(note, needle):
+        try:
+            drop.preview_payload(note)
+        except drop.PublishError as err:
+            return needle in str(err)
+        return False
+
+    check("no card note refused", payload_refused(None, "og.png"))
+    check("a custom image note refused", payload_refused({"title": "T", "image_source": "staged"}, "og.png"))
+    check("a blank title refused", payload_refused({"title": "  ", "image_source": "generated"}, "--card-title"))
+    check("a 301-char title refused", payload_refused({"title": "x" * 301, "image_source": "generated"}, "300"))
+    check("a 300-char title accepted",
+          drop.preview_payload({"title": "x" * 300, "image_source": "generated"})["title"] == "x" * 300)
 
 print(f"\n{passed} checks passed")

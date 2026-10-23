@@ -238,11 +238,95 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
+// --- public link preview for password shares (--public-preview) -------------
+// A password share normally reveals nothing without the password, so chat apps
+// show a bare link. A share published with --public-preview stores
+// `preview:<slug>` = {title, description} in AUTH_KV. Then the login page
+// carries og:/twitter: tags, and exactly one object is served without the
+// password: the generated title card at `<slug>/og.png`. Nothing else is exempt.
+const PREVIEW_IMAGE_PATH = "og.png";
+const PREVIEW_TITLE_MAX = 300;
+const PREVIEW_DESCRIPTION_MAX = 1000;
+
+function previewKey(slug) {
+  return `preview:${slug}`;
+}
+
+async function readPreview(env, slug) {
+  return env.AUTH_KV.get(previewKey(slug), { type: "json" });
+}
+
+// The share-root og.png only (never `x/og.png`, and never via the single-file
+// root fallback, which maps only `index.html`), and only while the current
+// manifest lists it.
+function isPreviewImageRequest(request, share, path) {
+  return (
+    (request.method === "GET" || request.method === "HEAD") &&
+    path === PREVIEW_IMAGE_PATH &&
+    share.files.some((file) => file.path === PREVIEW_IMAGE_PATH)
+  );
+}
+
+function previewMeta(slug, preview, origin) {
+  const pageUrl = escapeHtml(`${origin}/${slug}/`);
+  const imageUrl = escapeHtml(`${origin}/${slug}/${PREVIEW_IMAGE_PATH}`);
+  const title = escapeHtml(preview.title);
+  const description = preview.description ? escapeHtml(preview.description) : null;
+  const tags = [
+    '<meta property="og:type" content="website">',
+    `<meta property="og:title" content="${title}">`,
+  ];
+  if (description) tags.push(`<meta property="og:description" content="${description}">`);
+  tags.push(
+    `<meta property="og:url" content="${pageUrl}">`,
+    `<meta property="og:image" content="${imageUrl}">`,
+    '<meta property="og:image:width" content="1200">',
+    '<meta property="og:image:height" content="630">',
+    '<meta name="twitter:card" content="summary_large_image">',
+    `<meta name="twitter:title" content="${title}">`,
+  );
+  if (description) tags.push(`<meta name="twitter:description" content="${description}">`);
+  tags.push(`<meta name="twitter:image" content="${imageUrl}">`);
+  return tags.join("\n");
+}
+
+// An error message, or null when the payload's preview (if any) is valid.
+function validatePreview(payload) {
+  const preview = payload.preview;
+  if (preview === undefined || preview === null) return null;
+  if (payload.auth_mode !== "password") return "preview applies only to password shares";
+  if (typeof preview !== "object" || Array.isArray(preview)) return "preview must be an object";
+  if (typeof preview.title !== "string" || !preview.title.trim()) return "preview.title must be a non-empty string";
+  if (preview.title.length > PREVIEW_TITLE_MAX) return `preview.title is over ${PREVIEW_TITLE_MAX} characters`;
+  const description = preview.description;
+  if (description !== undefined && description !== null) {
+    if (typeof description !== "string") return "preview.description must be a string or null";
+    if (description.length > PREVIEW_DESCRIPTION_MAX) return `preview.description is over ${PREVIEW_DESCRIPTION_MAX} characters`;
+  }
+  if (!payload.files.some((file) => file && file.path === PREVIEW_IMAGE_PATH)) return `preview needs ${PREVIEW_IMAGE_PATH} in files`;
+  return null;
+}
+
+// Every publish rewrites the key: set with a preview, cleared without one, so a
+// republish that leaves out --public-preview turns the preview off.
+async function storePreview(env, payload) {
+  if (payload.preview) {
+    const { title, description } = payload.preview;
+    await env.AUTH_KV.put(previewKey(payload.slug), JSON.stringify({ title, description: description || null }));
+  } else {
+    await env.AUTH_KV.delete(previewKey(payload.slug));
+  }
+}
+// --- end public link preview -------------------------------------------------
+
 // Minimal, unbranded, fully self-contained login page (no external assets). Shows
 // the share label as a heading; otherwise reveals nothing. Served instead of the
 // old HTTP Basic dialog so browsers get a clean, professional, client-facing page.
-function loginPage(share, { error = false } = {}) {
+// With `preview` (a --public-preview share) the head also carries the share's
+// link-preview tags; without it the page is byte-identical to before.
+function loginPage(share, { error = false, preview = null, origin = "" } = {}) {
   const heading = escapeHtml(share.label || "Protected document");
+  const previewTags = preview ? `\n${previewMeta(share.slug, preview, origin)}` : "";
   const errorBlock = error
     ? '<p class="err" role="alert">Incorrect password. Please try again.</p>'
     : "";
@@ -251,7 +335,7 @@ function loginPage(share, { error = false } = {}) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex, nofollow">
+<meta name="robots" content="noindex, nofollow">${previewTags}
 <title>${heading}</title>
 <style>
   :root { color-scheme: light dark; }
@@ -380,7 +464,7 @@ async function enforceRateLimit(env, request, slug) {
   return true;
 }
 
-async function requireShareAuth(env, request, share) {
+async function requireShareAuth(env, request, share, path) {
   if (share.auth_mode === "public") return { ok: true };
   const slug = share.slug;
   const verifier = await env.AUTH_KV.get(`auth:${slug}`, { type: "json" });
@@ -418,11 +502,17 @@ async function requireShareAuth(env, request, share) {
       return { ok: false, response: loginRedirect(request, slug, token) };
     }
     if (!(await enforceRateLimit(env, request, slug))) return { ok: false, response: rateLimited() };
-    return { ok: false, response: loginPage(share, { error: true }) };
+    const preview = await readPreview(env, slug);
+    return { ok: false, response: loginPage(share, { error: true, preview, origin: new URL(request.url).origin }) };
   }
 
-  // 4) Unauthenticated browser request → serve the clean HTML login page.
-  return { ok: false, response: loginPage(share) };
+  // 4) Unauthenticated browser request → serve the clean HTML login page. The
+  //    preview key is read only here and in the failed POST above, never on a
+  //    cookie- or Basic-authenticated request. With a preview, the share-root
+  //    og.png is the one object served without the password.
+  const preview = await readPreview(env, slug);
+  if (preview && isPreviewImageRequest(request, share, path)) return { ok: true, previewImage: true };
+  return { ok: false, response: loginPage(share, { preview, origin: new URL(request.url).origin }) };
 }
 
 // One `view` audit row per page open, never per asset. A page load pulls many
@@ -459,7 +549,7 @@ async function serveArtifact(request, env, url, ctx) {
   if (share.revoked_at) return forbidden("revoked");
   if (isExpired(share)) return forbidden("expired");
 
-  const auth = await requireShareAuth(env, request, share);
+  const auth = await requireShareAuth(env, request, share, path);
   if (!auth.ok) return auth.response;
 
   // Gate serving to the CURRENT D1 manifest. R2 objects are not purged on a
@@ -474,6 +564,8 @@ async function serveArtifact(request, env, url, ctx) {
     objectPath = share.files[0].path;
   }
   if (!allowed.has(objectPath)) return notFound();
+  // Belt and braces: the preview exemption only ever serves the root card.
+  if (auth.previewImage && objectPath !== PREVIEW_IMAGE_PATH) return notFound();
   const object = await env.ARTIFACTS.get(`${slug}/${objectPath}`);
   if (!object) return notFound();
 
@@ -488,7 +580,8 @@ async function serveArtifact(request, env, url, ctx) {
   // Keep view tracking fully off the serving hot path: schedule it via
   // ctx.waitUntil so the viewer's bytes never wait on the dedupe read or the
   // audit write. With no ctx (unit tests) await it so the row is observable.
-  if (request.method === "GET") {
+  // The preview card served without the password is not a document open.
+  if (request.method === "GET" && !auth.previewImage) {
     const tracking = logView(env, request, share, objectPath);
     if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(tracking);
     else await tracking;
@@ -549,6 +642,10 @@ async function upsertManifest(request, env) {
   if (!["password", "public"].includes(payload.auth_mode)) return badRequest("invalid auth_mode");
   if (!Array.isArray(payload.files) || payload.files.length === 0) return badRequest("files must be a non-empty array");
   if (payload.auth_mode === "password" && !payload.password_verifier) return badRequest("missing password_verifier");
+  // --- public link preview: validate (see validatePreview) ---
+  const previewError = validatePreview(payload);
+  if (previewError) return badRequest(previewError);
+  // --- end public link preview ---
 
   await env.DB.prepare(
     `INSERT INTO shares (slug, label, auth_mode, sha256, files_json, bytes, scan_result_json, created_at, expires_at, revoked_at, uploader)
@@ -582,12 +679,16 @@ async function upsertManifest(request, env) {
     await env.AUTH_KV.delete(`auth:${payload.slug}`);
   }
   await env.AUTH_KV.delete(`deny:${payload.slug}`);
+  // --- public link preview: store or clear (see storePreview) ---
+  await storePreview(env, payload);
+  // --- end public link preview ---
   await recordAudit(env, payload.slug, "publish", payload.uploader, {
     auth_mode: payload.auth_mode,
     bytes: payload.bytes,
     files: payload.files.map((file) => file.path),
     scan_result: payload.scan_result,
     override_log: payload.override_log || [],
+    preview: Boolean(payload.preview),
   });
 
   return json({ ok: true, slug: payload.slug });
@@ -615,6 +716,7 @@ async function revokeShare(request, env) {
   if (!share) return notFound();
 
   await env.AUTH_KV.put(`deny:${slug}`, "1");
+  await env.AUTH_KV.delete(previewKey(slug));
   await env.DB.prepare("UPDATE shares SET revoked_at = ? WHERE slug = ?").bind(new Date().toISOString(), slug).run();
 
   const deleted = [];

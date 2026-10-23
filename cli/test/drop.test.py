@@ -721,6 +721,182 @@ def test_old_card_flags_still_tolerated_without_html():
     assert code == 0, err
 
 
+# --- --public-preview (password shares only) -------------------------------------
+
+DESCRIBED = Path(_ARTIFACTS.name) / "described.html"
+DESCRIBED.write_text(
+    '<html><head><meta charset="utf-8"><title>Project proposal</title>'
+    '<meta name="description" content="A short summary"></head><body>p</body></html>'
+)
+
+
+def _card_png():
+    img = Path(_ARTIFACTS.name) / "hero.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n")
+    return str(img)
+
+
+def _pdf():
+    pdf = Path(_ARTIFACTS.name) / "deck.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    return str(pdf)
+
+
+def test_public_preview_refused_on_no_password_tiers():
+    for flag in ("--public", "--unlisted"):
+        err = refused([flag, "--public-preview", "--yes", str(PAGE)], Fake(), "--public-preview is for password shares")
+        assert "already show" in err, err
+
+
+def test_public_preview_refused_with_no_card():
+    refused(["--public-preview", "--no-card", "--yes", str(PAGE)], Fake(), "--no-card turns it off")
+
+
+def test_public_preview_refused_with_card_image():
+    err = refused(["--public-preview", "--card-image", _card_png(), "--yes", str(PAGE)], Fake(),
+                  "--public-preview exposes only the generated title card")
+    assert "--card-image is not supported with it yet" in err, err
+
+
+def test_public_preview_refused_without_html():
+    refused(["--public-preview", "--yes", _pdf()], Fake(), "--public-preview needs an HTML page")
+
+
+def test_public_preview_refused_when_artifact_has_its_own_og_png():
+    site = Path(_ARTIFACTS.name) / "site-with-og"
+    site.mkdir(exist_ok=True)
+    (site / "index.html").write_text('<html><head><meta charset="utf-8"><title>Site</title></head></html>')
+    (site / "og.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    refused(["--public-preview", "--yes", str(site)], Fake(), "already has an og.png")
+
+
+def test_update_public_preview_refusals():
+    password_row = [row("deck", auth_mode="password")]
+    pw = ["--password", "hunter22hunter22"]
+    # On a share with no password (unlisted or public): the preview is already public.
+    for visibility in ("unlisted", "public", None):
+        refused(["update", UNLISTED, "--public-preview", "--yes", str(PAGE)],
+                Fake(rows=[row(UNLISTED, visibility=visibility)]), "drop --public-preview")
+    # The card refusals come before even the lookup.
+    for flags, needle in ((["--no-card"], "--no-card turns it off"),
+                          (["--card-image", _card_png()], "--card-image is not supported with it yet")):
+        fake = Fake(rows=password_row)
+        refused(["update", "deck", *pw, "--public-preview", *flags, "--yes", str(PAGE)], fake, needle)
+        assert not fake.events, fake.events
+    refused(["update", "deck", *pw, "--public-preview", "--yes", _pdf()], Fake(rows=password_row),
+            "--public-preview needs an HTML page")
+    # --public / --unlisted have no place in update at all.
+    refused(["update", "deck", "--public", "--public-preview", "--yes", str(PAGE)], Fake(rows=password_row), "inherited")
+
+
+def test_public_preview_manifest_carries_the_staged_card_text():
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--yes", str(DESCRIBED)], fake)
+    assert code == 0, err
+    manifest = fake.manifests[0]
+    assert manifest["auth_mode"] == "password", manifest
+    assert manifest["preview"] == {"title": "Project proposal", "description": "A short summary"}, manifest
+    assert "og.png" in [f["path"] for f in manifest["files"]], manifest["files"]
+
+
+def test_public_preview_title_falls_back_like_the_card():
+    # PAGE has a <title> but no meta description.
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert fake.manifests[0]["preview"] == {"title": "Page", "description": None}, fake.manifests[0]
+
+
+def test_public_preview_uses_card_title_and_description_overrides():
+    fake = Fake()
+    argv = ["--public-preview", "--card-title", "Q3 plan", "--card-description", "For review", "--dry-run", "--yes", str(DESCRIBED)]
+    code, out, err = run_cli(argv, fake)
+    assert code == 0, err
+    data = json.loads(out)
+    assert data["manifest"]["preview"] == {"title": "Q3 plan", "description": "For review"}, data
+    # The same values the staged card itself carries.
+    assert data["card"]["title"] == "Q3 plan" and data["card"]["description"] == "For review", data["card"]
+    assert "upload" not in fake.kinds() and not fake.manifests, fake.events
+
+
+def test_public_preview_description_matches_the_truncated_page_meta():
+    long_desc = "word " * 100
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--card-description", long_desc, "--dry-run", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    preview = json.loads(out)["manifest"]["preview"]
+    assert preview["description"] == long_desc[: drop.OG_DESCRIPTION_MAX], preview
+
+
+def test_no_preview_key_without_the_flag():
+    fake = Fake()
+    code, out, err = run_cli(["--yes", str(DESCRIBED)], fake)
+    assert code == 0, err
+    assert "preview" not in fake.manifests[0], fake.manifests[0]
+    assert "preview:" not in out, out
+
+
+def test_public_preview_output_line():
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    lines = out.splitlines()
+    preview_line = "preview: public (title, description and og.png load without the password)"
+    assert preview_line in lines, out
+    assert lines.index(preview_line) > next(i for i, line in enumerate(lines) if line.startswith("card: ")), out
+
+
+def test_public_preview_title_over_the_limit_refused_before_upload():
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--card-title", "x" * 301, "--yes", str(PAGE)], fake)
+    assert code == 1 and "shorter --card-title" in err, (code, err)
+    assert "upload" not in fake.kinds() and not fake.manifests, fake.events
+
+
+def test_update_public_preview_is_set_per_publish_not_inherited():
+    fake = Fake(rows=[row("deck", auth_mode="password")])
+    pw = ["--password", "hunter22hunter22"]
+    code, out, err = run_cli(["update", "deck", *pw, "--public-preview", "--yes", str(DESCRIBED)], fake)
+    assert code == 0, err
+    assert fake.manifests[-1]["preview"]["title"] == "Project proposal", fake.manifests[-1]
+    assert "preview: public" in out, out
+    # The next update without the flag sends no preview, which turns it off.
+    code, out, err = run_cli(["update", "deck", *pw, "--yes", str(DESCRIBED)], fake)
+    assert code == 0, err
+    assert "preview" not in fake.manifests[-1], fake.manifests[-1]
+    # Same for a plain --slug republish.
+    code, out, err = run_cli(["--slug", "deck", *pw, "--yes", str(DESCRIBED)], fake)
+    assert code == 0, err
+    assert "preview" not in fake.manifests[-1], fake.manifests[-1]
+
+
+def test_confirmation_mentions_the_public_preview():
+    class Tty:
+        def isatty(self):
+            return True
+
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return "publish"
+
+    saved_stdin = sys.stdin
+    drop.input = answer
+    sys.stdin = Tty()
+    try:
+        drop.public_confirm(argparse.Namespace(yes=False, public_preview=True))
+        drop.public_confirm(argparse.Namespace(yes=False, public_preview=False))
+    finally:
+        sys.stdin = saved_stdin
+        del drop.input
+    with_preview, without = prompts
+    assert "link preview (title, description and card image)" in with_preview, with_preview
+    assert "anyone with the link, without the password" in with_preview, with_preview
+    assert with_preview.endswith("Type 'publish' to continue: "), with_preview
+    assert "preview" not in without and "without the password" not in without, without
+
+
 def main():
     tests = [value for name, value in globals().items() if name.startswith("test_") and callable(value)]
     for test in tests:
