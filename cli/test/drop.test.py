@@ -144,6 +144,7 @@ class Fake:
         self.events = []
         self.manifests = []
         self.uploads = []
+        self.upload_shas = []
         self.deletes = []
         self.preflight_files = []
 
@@ -163,6 +164,8 @@ class Fake:
     def upload_r2(self, files, slug):
         self.events.append(("upload", slug))
         self.uploads.append((slug, sorted(rel for _, rel in files)))
+        # The bytes as they go up (the staged copies are gone after publish).
+        self.upload_shas.append({rel: hashlib.sha256(path.read_bytes()).hexdigest() for path, rel in files})
 
     def preflight(self, path, files, args):
         self.events.append(("preflight",))
@@ -789,14 +792,39 @@ def test_update_public_preview_refusals():
     refused(["update", "deck", "--public", "--public-preview", "--yes", str(PAGE)], Fake(rows=password_row), "inherited")
 
 
+def _preview_text(preview):
+    """The preview's title and description, without the card hash."""
+    return {key: value for key, value in preview.items() if key != "image_sha256"}
+
+
 def test_public_preview_manifest_carries_the_staged_card_text():
     fake = Fake()
     code, out, err = run_cli(["--public-preview", "--yes", str(DESCRIBED)], fake)
     assert code == 0, err
     manifest = fake.manifests[0]
     assert manifest["auth_mode"] == "password", manifest
-    assert manifest["preview"] == {"title": "Project proposal", "description": "A short summary"}, manifest
+    assert _preview_text(manifest["preview"]) == {"title": "Project proposal", "description": "A short summary"}, manifest
     assert "og.png" in [f["path"] for f in manifest["files"]], manifest["files"]
+
+
+def test_public_preview_binds_the_exact_card_bytes():
+    # The Worker serves og.png without the password only while the stored bytes
+    # hash to preview.image_sha256, so it must be the staged card's own sha256:
+    # the og.png row in files, and the bytes that actually went up to R2.
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--yes", str(DESCRIBED)], fake)
+    assert code == 0, err
+    manifest = fake.manifests[0]
+    image_sha = manifest["preview"]["image_sha256"]
+    assert len(image_sha) == 64 and image_sha == image_sha.lower(), image_sha
+    card_row = next(f for f in manifest["files"] if f["path"] == "og.png")
+    assert image_sha == card_row["sha256"], (image_sha, card_row)
+    assert image_sha == fake.upload_shas[0]["og.png"], fake.upload_shas
+    # A different title is a different card, so a different hash.
+    other = Fake()
+    code, out, err = run_cli(["--public-preview", "--card-title", "Another title", "--yes", str(DESCRIBED)], other)
+    assert code == 0, err
+    assert other.manifests[0]["preview"]["image_sha256"] != image_sha
 
 
 def test_public_preview_title_falls_back_like_the_card():
@@ -804,7 +832,7 @@ def test_public_preview_title_falls_back_like_the_card():
     fake = Fake()
     code, out, err = run_cli(["--public-preview", "--yes", str(PAGE)], fake)
     assert code == 0, err
-    assert fake.manifests[0]["preview"] == {"title": "Page", "description": None}, fake.manifests[0]
+    assert _preview_text(fake.manifests[0]["preview"]) == {"title": "Page", "description": None}, fake.manifests[0]
 
 
 def test_public_preview_uses_card_title_and_description_overrides():
@@ -813,7 +841,9 @@ def test_public_preview_uses_card_title_and_description_overrides():
     code, out, err = run_cli(argv, fake)
     assert code == 0, err
     data = json.loads(out)
-    assert data["manifest"]["preview"] == {"title": "Q3 plan", "description": "For review"}, data
+    assert _preview_text(data["manifest"]["preview"]) == {"title": "Q3 plan", "description": "For review"}, data
+    card_row = next(f for f in data["manifest"]["files"] if f["path"] == "og.png")
+    assert data["manifest"]["preview"]["image_sha256"] == card_row["sha256"], data["manifest"]
     # The same values the staged card itself carries.
     assert data["card"]["title"] == "Q3 plan" and data["card"]["description"] == "For review", data["card"]
     assert "upload" not in fake.kinds() and not fake.manifests, fake.events
@@ -851,6 +881,39 @@ def test_public_preview_title_over_the_limit_refused_before_upload():
     code, out, err = run_cli(["--public-preview", "--card-title", "x" * 301, "--yes", str(PAGE)], fake)
     assert code == 1 and "shorter --card-title" in err, (code, err)
     assert "upload" not in fake.kinds() and not fake.manifests, fake.events
+
+
+def test_public_preview_title_limit_counts_utf16_units_like_the_worker():
+    # 151 emoji are 151 code points (under 300) but 302 UTF-16 units, which the
+    # Worker's String.length check refuses. The CLI must refuse first, before
+    # anything uploads.
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--card-title", "\U0001F600" * 151, "--yes", str(PAGE)], fake)
+    assert code == 1 and "302 characters" in err and "shorter --card-title" in err, (code, err)
+    assert "upload" not in fake.kinds() and not fake.manifests, fake.events
+    # 150 emoji (300 units) is at the limit and goes through.
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--card-title", "\U0001F600" * 150, "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert fake.manifests[0]["preview"]["title"] == "\U0001F600" * 150
+
+
+def test_public_preview_warns_when_the_card_cannot_draw_the_title():
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--card-title", "Caf\u00e9 plan", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert "plain ASCII" in err and "'\u00e9'" in err, err
+    assert any("plain ASCII" in w for w in fake.manifests[0]["scan_result"]["warnings"]), fake.manifests[0]["scan_result"]
+    # Too long for the card's five lines.
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--card-title", " ".join(["word"] * 60), "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert "too long for the card image" in err, err
+    # Without --public-preview the same card publishes with no such warning.
+    fake = Fake()
+    code, out, err = run_cli(["--card-title", "Caf\u00e9 plan", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert "plain ASCII" not in err and "too long for the card image" not in err, err
 
 
 def test_update_public_preview_is_set_per_publish_not_inherited():

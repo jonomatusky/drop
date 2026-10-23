@@ -856,6 +856,47 @@ def _wrap_text(text: str, max_chars: int) -> list[str]:
     return lines or [""]
 
 
+_OG_CARD_MARGIN = 80
+_OG_CARD_MAX_LINES = 5
+
+
+def _layout_card_title(title: str, width: int = 1200, height: int = 630) -> tuple[int, list[str], int, bool]:
+    """How the card lays out a title: (scale, lines, line height, clipped).
+
+    Picks the largest scale at which the title fits in a sensible number of lines
+    and leaves room for the footer. At the smallest scale, lines past the fifth
+    are cut, and `clipped` is True."""
+    usable = width - 2 * _OG_CARD_MARGIN
+    all_lines = _wrap_text(title, usable // (8 * 5))
+    for scale in range(11, 4, -1):
+        lines = _wrap_text(title, usable // (8 * scale))
+        lh = 8 * scale + scale * 2
+        max_lines = 4 if scale > 6 else _OG_CARD_MAX_LINES
+        if len(lines) <= max_lines and len(lines) * lh <= height - 230:
+            return scale, lines, lh, False
+    return 5, all_lines[:_OG_CARD_MAX_LINES], 8 * 5 + 10, len(all_lines) > _OG_CARD_MAX_LINES
+
+
+def card_title_warnings(title: str) -> list[str]:
+    """Where the generated card would not match the title it is meant to show:
+    characters the bitmap font cannot draw (printable ASCII only; the rest become
+    "?"), or a title too long for the card's five lines."""
+    warnings: list[str] = []
+    undrawable = sorted({ch for ch in "".join(title.split()) if not 0x20 <= ord(ch) <= 0x7E})
+    if undrawable:
+        shown = " ".join(repr(ch) for ch in undrawable[:8]) + (" ..." if len(undrawable) > 8 else "")
+        warnings.append(
+            f"--public-preview: the card image draws only plain ASCII, so {shown} in the title show as \"?\" "
+            "on og.png while og:title shows the real text; pass an ASCII --card-title to match"
+        )
+    if _layout_card_title(title.strip())[3]:
+        warnings.append(
+            f"--public-preview: the title is too long for the card image, which shows only its first "
+            f"{_OG_CARD_MAX_LINES} lines; pass a shorter --card-title to match og:title"
+        )
+    return warnings
+
+
 def render_og_card(
     title: str,
     footer: str,
@@ -880,21 +921,10 @@ def render_og_card(
     for y in range(10):
         buf[y * width * 3 : (y + 1) * width * 3] = bar
 
-    margin = 80
+    margin = _OG_CARD_MARGIN
     usable = width - 2 * margin
     title = title.strip() or footer
-    # Pick the largest scale at which the title fits in a sensible number of lines
-    # and leaves room for the footer.
-    chosen_scale, chosen_lines, line_h = 5, _wrap_text(title, usable // (8 * 5)), 8 * 5 + 10
-    for scale in range(11, 4, -1):
-        lines = _wrap_text(title, usable // (8 * scale))
-        lh = 8 * scale + scale * 2
-        max_lines = 4 if scale > 6 else 5
-        if len(lines) <= max_lines and len(lines) * lh <= height - 230:
-            chosen_scale, chosen_lines, line_h = scale, lines, lh
-            break
-    else:
-        chosen_lines = chosen_lines[:5]
+    chosen_scale, chosen_lines, line_h, _ = _layout_card_title(title, width, height)
 
     block_h = len(chosen_lines) * line_h
     y0 = (height - block_h) // 2 - 16
@@ -910,10 +940,20 @@ def render_og_card(
 
 _OG_BLOCK_START = "<!-- drop:og -->"
 _OG_BLOCK_END = "<!-- /drop:og -->"
-# The page's og:/twitter: description is cut to this many characters.
+# The page's og:/twitter: description is cut to this many characters (code
+# points). That is at most 600 UTF-16 units, well under the Worker's 1000-unit
+# cap on preview.description, so the description needs no check of its own.
 OG_DESCRIPTION_MAX = 300
-# The Worker's cap on a --public-preview title (see validatePreview there).
+# The Worker's cap on a --public-preview title (see validatePreview there). It
+# counts UTF-16 code units (JavaScript's String.length), so check with
+# utf16_length, not len().
 PREVIEW_TITLE_MAX = 300
+
+
+def utf16_length(value: str) -> int:
+    """The length JavaScript's String.length reports: UTF-16 code units, so a
+    character outside the Basic Multilingual Plane (most emoji) counts as two."""
+    return len(value.encode("utf-16-le", errors="surrogatepass")) // 2
 
 
 def _esc_attr(value: str) -> str:
@@ -1207,21 +1247,29 @@ def check_public_preview_tier(auth_mode: str, args: argparse.Namespace, slug: st
     )
 
 
-def preview_payload(card_note: dict | None) -> dict:
+def preview_payload(card_note: dict | None, file_rows: list[dict]) -> dict:
     """The manifest's `preview` for --public-preview: the exact title and
-    description the staged card carries. Checked against the Worker's limits
-    here, so a bad value fails before anything uploads."""
+    description the staged card carries, plus the sha256 of the staged og.png.
+    The Worker serves og.png without the password only while the stored object
+    hashes to that value, so the exemption covers these exact card bytes and
+    nothing else. Checked against the Worker's limits here, so a bad value
+    fails before anything uploads."""
     if not card_note or card_note.get("image_source") != "generated":
         raise PublishError("--public-preview needs the generated og.png card, and none was staged")
+    card_row = next((row for row in file_rows if row["path"] == "og.png"), None)
+    if card_row is None:
+        raise PublishError("--public-preview needs the generated og.png card, and none was staged")
     title = card_note["title"]
-    if not title.strip():
+    # JavaScript's trim() also strips U+FEFF, which Python's strip() keeps.
+    if not title.replace("\ufeff", "").strip():
         raise PublishError("--public-preview needs a card title; pass --card-title")
-    if len(title) > PREVIEW_TITLE_MAX:
+    units = utf16_length(title)
+    if units > PREVIEW_TITLE_MAX:
         raise PublishError(
-            f"--public-preview: the card title is {len(title)} characters and the limit is "
+            f"--public-preview: the card title is {units} characters (UTF-16 units) and the limit is "
             f"{PREVIEW_TITLE_MAX}; pass a shorter --card-title"
         )
-    return {"title": title, "description": card_note.get("description")}
+    return {"title": title, "description": card_note.get("description"), "image_sha256": card_row["sha256"]}
 
 
 def resolve_card_image(image_arg: str, files: list[tuple[Path, str]]) -> tuple[Path, str, bool]:
@@ -1292,6 +1340,10 @@ def stage_publish_set(
             fg = _parse_hex_color(args.card_fg, (232, 235, 242))
             accent = _parse_hex_color(args.card_accent, (122, 162, 255))
             png = render_og_card(title, f"{host}/{slug}", bg=bg, fg=fg, accent=accent)
+            if getattr(args, "public_preview", False):
+                # The card is public with this flag, so say when it would not
+                # show the same title as og:title. (No change without the flag.)
+                warnings.extend(card_title_warnings(title))
         image_url = f"{base}/{slug}/{urllib.parse.quote(image_rel)}"
         meta = {
             "title": title,
@@ -1693,7 +1745,7 @@ def publish_artifact(
         if password:
             manifest["password_verifier"] = password_verifier(password)
         if args.public_preview:
-            manifest["preview"] = preview_payload(card_note)
+            manifest["preview"] = preview_payload(card_note, file_rows)
 
         if args.dry_run:
             print(json.dumps({"dry_run": True, "url": f"{base}/{slug}/", "card": card_note, "manifest": manifest}, indent=2))

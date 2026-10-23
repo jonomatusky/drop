@@ -241,19 +241,61 @@ function escapeHtml(value) {
 // --- public link preview for password shares (--public-preview) -------------
 // A password share normally reveals nothing without the password, so chat apps
 // show a bare link. A share published with --public-preview stores
-// `preview:<slug>` = {title, description} in AUTH_KV. Then the login page
-// carries og:/twitter: tags, and exactly one object is served without the
-// password: the generated title card at `<slug>/og.png`. Nothing else is exempt.
+// `preview:<slug>` = {title, description, image_sha256} in AUTH_KV. Then the
+// login page carries og:/twitter: tags, and exactly one object is served
+// without the password: the generated title card at `<slug>/og.png`. Nothing
+// else is exempt.
+//
+// The entitlement is bound to exact bytes, not to the path. KV reads can be
+// stale for a while after a republish, and the CLI uploads to R2 before it
+// writes the manifest, so neither the key nor the R2 object alone can be
+// trusted. The card is served only while all three agree: the key's
+// image_sha256, the CURRENT D1 manifest's og.png row sha256, and the sha256 of
+// the bytes read from R2. Any mismatch is the plain login page. So a stale key
+// or an overwritten object can at most serve the card the owner approved.
 const PREVIEW_IMAGE_PATH = "og.png";
 const PREVIEW_TITLE_MAX = 300;
 const PREVIEW_DESCRIPTION_MAX = 1000;
+// The generated card is a few KB to a few tens of KB. Refuse to buffer more.
+const PREVIEW_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 function previewKey(slug) {
   return `preview:${slug}`;
 }
 
-async function readPreview(env, slug) {
-  return env.AUTH_KV.get(previewKey(slug), { type: "json" });
+// The sha256 the manifest lists for its share-root og.png, or null.
+function manifestCardSha(files) {
+  const row = Array.isArray(files) ? files.find((file) => file && file.path === PREVIEW_IMAGE_PATH) : null;
+  return row && typeof row.sha256 === "string" && SHA256_HEX.test(row.sha256) ? row.sha256 : null;
+}
+
+// The stored preview, but only when it names the card the CURRENT manifest
+// lists. A stale key (after an opt-out, or a republish with a new card) whose
+// image_sha256 no longer matches counts as no preview at all.
+async function readPreview(env, share) {
+  const preview = await env.AUTH_KV.get(previewKey(share.slug), { type: "json" });
+  if (!preview || typeof preview !== "object" || typeof preview.title !== "string") return null;
+  const cardSha = manifestCardSha(share.files);
+  if (!cardSha || preview.image_sha256 !== cardSha) return null;
+  return preview;
+}
+
+async function sha256Hex(bytes) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+// The R2 object's bytes when they hash to the approved card, else null. The size
+// is checked before anything is buffered.
+async function approvedCardBytes(object, imageSha256) {
+  if (typeof object.size !== "number" || object.size > PREVIEW_IMAGE_MAX_BYTES) {
+    if (object.body && typeof object.body.cancel === "function") await object.body.cancel();
+    return null;
+  }
+  const bytes = await object.arrayBuffer();
+  if (bytes.byteLength > PREVIEW_IMAGE_MAX_BYTES) return null;
+  return (await sha256Hex(bytes)) === imageSha256 ? bytes : null;
 }
 
 // The share-root og.png only (never `x/og.png`, and never via the single-file
@@ -303,7 +345,11 @@ function validatePreview(payload) {
     if (typeof description !== "string") return "preview.description must be a string or null";
     if (description.length > PREVIEW_DESCRIPTION_MAX) return `preview.description is over ${PREVIEW_DESCRIPTION_MAX} characters`;
   }
-  if (!payload.files.some((file) => file && file.path === PREVIEW_IMAGE_PATH)) return `preview needs ${PREVIEW_IMAGE_PATH} in files`;
+  const cardRow = payload.files.find((file) => file && file.path === PREVIEW_IMAGE_PATH);
+  if (!cardRow) return `preview needs ${PREVIEW_IMAGE_PATH} in files`;
+  const imageSha = preview.image_sha256;
+  if (typeof imageSha !== "string" || !SHA256_HEX.test(imageSha)) return "preview.image_sha256 must be a lowercase hex sha256";
+  if (cardRow.sha256 !== imageSha) return `preview.image_sha256 does not match the ${PREVIEW_IMAGE_PATH} sha256 in files`;
   return null;
 }
 
@@ -311,8 +357,11 @@ function validatePreview(payload) {
 // republish that leaves out --public-preview turns the preview off.
 async function storePreview(env, payload) {
   if (payload.preview) {
-    const { title, description } = payload.preview;
-    await env.AUTH_KV.put(previewKey(payload.slug), JSON.stringify({ title, description: description || null }));
+    const { title, description, image_sha256 } = payload.preview;
+    await env.AUTH_KV.put(
+      previewKey(payload.slug),
+      JSON.stringify({ title, description: description || null, image_sha256 }),
+    );
   } else {
     await env.AUTH_KV.delete(previewKey(payload.slug));
   }
@@ -502,16 +551,19 @@ async function requireShareAuth(env, request, share, path) {
       return { ok: false, response: loginRedirect(request, slug, token) };
     }
     if (!(await enforceRateLimit(env, request, slug))) return { ok: false, response: rateLimited() };
-    const preview = await readPreview(env, slug);
+    const preview = await readPreview(env, share);
     return { ok: false, response: loginPage(share, { error: true, preview, origin: new URL(request.url).origin }) };
   }
 
   // 4) Unauthenticated browser request → serve the clean HTML login page. The
   //    preview key is read only here and in the failed POST above, never on a
-  //    cookie- or Basic-authenticated request. With a preview, the share-root
-  //    og.png is the one object served without the password.
-  const preview = await readPreview(env, slug);
-  if (preview && isPreviewImageRequest(request, share, path)) return { ok: true, previewImage: true };
+  //    cookie- or Basic-authenticated request. With a preview that matches the
+  //    current manifest, the share-root og.png is the one object served without
+  //    the password, and serveArtifact still checks its bytes (previewSha256).
+  const preview = await readPreview(env, share);
+  if (preview && isPreviewImageRequest(request, share, path)) {
+    return { ok: true, previewSha256: preview.image_sha256 };
+  }
   return { ok: false, response: loginPage(share, { preview, origin: new URL(request.url).origin }) };
 }
 
@@ -564,24 +616,33 @@ async function serveArtifact(request, env, url, ctx) {
     objectPath = share.files[0].path;
   }
   if (!allowed.has(objectPath)) return notFound();
+  const previewImage = Boolean(auth.previewSha256);
   // Belt and braces: the preview exemption only ever serves the root card.
-  if (auth.previewImage && objectPath !== PREVIEW_IMAGE_PATH) return notFound();
+  if (previewImage && objectPath !== PREVIEW_IMAGE_PATH) return notFound();
   const object = await env.ARTIFACTS.get(`${slug}/${objectPath}`);
-  if (!object) return notFound();
+  // An unauthenticated card request that fails any check gets the same plain
+  // login page as a share with no preview.
+  if (!object) return previewImage ? loginPage(share) : notFound();
+  let body = object.body;
+  if (previewImage) {
+    // The R2 bytes must be the exact card the manifest and the key approved.
+    body = await approvedCardBytes(object, auth.previewSha256);
+    if (!body) return loginPage(share);
+  }
 
   const headers = securityHeaders({
     "content-type": contentTypeFor(objectPath, object),
     "etag": object.httpEtag || undefined,
   });
   if (request.method === "HEAD") return new Response(null, { status: 200, headers });
-  const response = new Response(object.body, { status: 200, headers });
+  const response = new Response(body, { status: 200, headers });
   // Count the open only on a real document GET (not HEAD prefetch, not the login
   // POST). Asset requests and refreshes are filtered/deduped inside logView.
   // Keep view tracking fully off the serving hot path: schedule it via
   // ctx.waitUntil so the viewer's bytes never wait on the dedupe read or the
   // audit write. With no ctx (unit tests) await it so the row is observable.
   // The preview card served without the password is not a document open.
-  if (request.method === "GET" && !auth.previewImage) {
+  if (request.method === "GET" && !previewImage) {
     const tracking = logView(env, request, share, objectPath);
     if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(tracking);
     else await tracking;
