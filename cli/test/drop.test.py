@@ -793,8 +793,10 @@ def test_update_public_preview_refusals():
 
 
 def _preview_text(preview):
-    """The preview's title and description, without the card hash."""
-    return {key: value for key, value in preview.items() if key != "image_sha256"}
+    """The preview's title and description, without the card hash (and without
+    site name and alt text, which these cases leave unset)."""
+    assert preview["site_name"] is None and preview["image_alt"] is None, preview
+    return {key: value for key, value in preview.items() if key in ("title", "description")}
 
 
 def test_public_preview_manifest_carries_the_staged_card_text():
@@ -883,37 +885,195 @@ def test_public_preview_title_over_the_limit_refused_before_upload():
     assert "upload" not in fake.kinds() and not fake.manifests, fake.events
 
 
-def test_public_preview_title_limit_counts_utf16_units_like_the_worker():
-    # 151 emoji are 151 code points (under 300) but 302 UTF-16 units, which the
-    # Worker's String.length check refuses. The CLI must refuse first, before
-    # anything uploads.
-    fake = Fake()
-    code, out, err = run_cli(["--public-preview", "--card-title", "\U0001F600" * 151, "--yes", str(PAGE)], fake)
-    assert code == 1 and "302 characters" in err and "shorter --card-title" in err, (code, err)
-    assert "upload" not in fake.kinds() and not fake.manifests, fake.events
-    # 150 emoji (300 units) is at the limit and goes through.
-    fake = Fake()
-    code, out, err = run_cli(["--public-preview", "--card-title", "\U0001F600" * 150, "--yes", str(PAGE)], fake)
-    assert code == 0, err
-    assert fake.manifests[0]["preview"]["title"] == "\U0001F600" * 150
+def test_public_preview_emoji_titles_are_refused_before_upload():
+    # The card draws ASCII only, so an emoji title is refused before the
+    # 300-unit check is even reached (preview_payload still counts UTF-16 units
+    # like the Worker; card.test.py covers that directly). Either way nothing
+    # uploads.
+    for count in (150, 151):
+        fake = Fake()
+        code, out, err = run_cli(["--public-preview", "--card-title", "\U0001F600" * count, "--yes", str(PAGE)], fake)
+        assert code == 1 and "pass an ASCII --card-title" in err, (code, err)
+        assert "upload" not in fake.kinds() and not fake.manifests, fake.events
 
 
-def test_public_preview_warns_when_the_card_cannot_draw_the_title():
+def test_public_preview_refuses_a_card_that_cannot_draw_the_title():
+    # Non-ASCII: the card would show "?" where og:title shows the real text.
+    for title in ("Caf\u00e9 plan", "Plan \U0001F600"):
+        fake = Fake()
+        code, out, err = run_cli(["--public-preview", "--card-title", title, "--yes", str(PAGE)], fake)
+        assert code == 1, (code, err)
+        assert "plain ASCII" in err and "pass an ASCII --card-title" in err, err
+        assert "upload" not in fake.kinds() and not fake.manifests, fake.events
+    # A <title> from the page is checked the same way.
+    accented = Path(_ARTIFACTS.name) / "accented.html"
+    accented.write_text('<html><head><meta charset="utf-8"><title>Caf\u00e9</title></head><body>p</body></html>')
     fake = Fake()
-    code, out, err = run_cli(["--public-preview", "--card-title", "Caf\u00e9 plan", "--yes", str(PAGE)], fake)
+    code, out, err = run_cli(["--public-preview", "--yes", str(accented)], fake)
+    assert code == 1 and "'\u00e9'" in err and "pass an ASCII --card-title" in err, err
+    assert "upload" not in fake.kinds(), fake.events
+    # An ASCII --card-title fixes it.
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--card-title", "Cafe", "--yes", str(accented)], fake)
     assert code == 0, err
-    assert "plain ASCII" in err and "'\u00e9'" in err, err
-    assert any("plain ASCII" in w for w in fake.manifests[0]["scan_result"]["warnings"]), fake.manifests[0]["scan_result"]
+    assert fake.manifests[0]["preview"]["title"] == "Cafe"
     # Too long for the card's five lines.
     fake = Fake()
     code, out, err = run_cli(["--public-preview", "--card-title", " ".join(["word"] * 60), "--yes", str(PAGE)], fake)
-    assert code == 0, err
-    assert "too long for the card image" in err, err
-    # Without --public-preview the same card publishes with no such warning.
+    assert code == 1 and "too long for the card image" in err and "shorter --card-title" in err, err
+    assert "upload" not in fake.kinds() and not fake.manifests, fake.events
+    # Without --public-preview the same cards publish with no warning at all.
+    for title in ("Caf\u00e9 plan", " ".join(["word"] * 60)):
+        fake = Fake()
+        code, out, err = run_cli(["--card-title", title, "--yes", str(PAGE)], fake)
+        assert code == 0, err
+        assert "plain ASCII" not in err and "too long for the card image" not in err, err
+
+
+def _entity_page():
+    page = Path(_ARTIFACTS.name) / "entity.html"
+    page.write_text('<html><head><meta charset="utf-8"><title>Client &#49;23-45-6789</title></head><body>p</body></html>')
+    return page
+
+
+def test_public_preview_pii_scan_catches_an_entity_encoded_title():
+    # The file scan sees `&#49;23-45-6789`, which is not SSN-shaped. The public
+    # title decodes to `Client 123-45-6789`, and that is what gets scanned.
+    page = _entity_page()
     fake = Fake()
-    code, out, err = run_cli(["--card-title", "Caf\u00e9 plan", "--yes", str(PAGE)], fake)
+    code, out, err = run_cli(["--public-preview", "--yes", str(page)], fake)
+    assert code == 1, (code, err)
+    assert "high-confidence PII" in err and "title: SSN-like value" in err and "--allow-pii" in err, err
+    assert "upload" not in fake.kinds() and not fake.manifests, fake.events
+    # Without --public-preview the title stays behind the password: no new scan.
+    fake = Fake()
+    code, out, err = run_cli(["--yes", str(page)], fake)
     assert code == 0, err
-    assert "plain ASCII" not in err and "too long for the card image" not in err, err
+
+
+def test_public_preview_pii_scan_covers_every_public_value():
+    for flag in ("--card-title", "--card-description", "--card-site-name", "--card-image-alt"):
+        field = {"--card-title": "title", "--card-description": "description",
+                 "--card-site-name": "site_name", "--card-image-alt": "image_alt"}[flag]
+        for value in ("ID 123-45-6789", "ID &#49;23-45-6789", "api_key = abcdefgh12345678"):
+            fake = Fake()
+            code, out, err = run_cli(["--public-preview", flag, value, "--yes", str(PAGE)], fake)
+            assert code == 1 and f"{field}: " in err and "high-confidence PII" in err, (flag, value, err)
+            assert "upload" not in fake.kinds(), fake.events
+    # A clean preview publishes.
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--card-site-name", "Acme", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+
+
+def test_public_preview_pii_scan_runs_before_the_confirmation():
+    prompts = []
+    saved = drop.public_confirm
+    drop.public_confirm = lambda args: prompts.append(args)
+    try:
+        code, out, err = run_cli(["--public-preview", str(_entity_page())], Fake())
+    finally:
+        drop.public_confirm = saved
+    assert code == 1 and "SSN-like value" in err, err
+    assert prompts == [], "refused before the publish prompt"
+
+
+def test_public_preview_pii_allow_pii_overrides_and_is_logged():
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--allow-pii", "test fixture", "--yes", str(_entity_page())], fake)
+    assert code == 0, err
+    manifest = fake.manifests[0]
+    assert manifest["preview"]["title"] == "Client 123-45-6789", manifest["preview"]
+    entries = [entry for entry in manifest["override_log"] if entry["type"] == "preview-pii"]
+    assert len(entries) == 1 and entries[0]["reason"] == "test fixture", manifest["override_log"]
+    assert {"actor", "host", "at"} <= set(entries[0]), entries[0]
+    assert manifest["scan_result"]["override_log"] == manifest["override_log"], manifest
+    assert any("public preview PII override: title: SSN-like value" in w for w in manifest["scan_result"]["warnings"])
+    assert "public preview PII override" in err, err
+
+
+def test_public_preview_pii_low_confidence_finding_warns():
+    fake = Fake()
+    code, out, err = run_cli(["--public-preview", "--card-description", "Contact sales@example.com", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert "public preview description: email addresses (1 unique)" in err, err
+    assert not fake.manifests[0]["override_log"], fake.manifests[0]["override_log"]
+
+
+def test_public_preview_rechecks_a_title_that_changes_with_the_final_slug():
+    # No <title>, label or --card-title: the card title falls back to the slug,
+    # which becomes `untitled-2` once the clash resolver runs. The final value is
+    # checked too, and the manifest carries it.
+    page = Path(_ARTIFACTS.name) / "untitled.html"
+    page.write_text('<html><head><meta charset="utf-8"></head><body>p</body></html>')
+    checked = []
+    saved = drop.check_public_preview_text
+
+    def spy(text, args):
+        checked.append(text["title"])
+        return saved(text, args)
+
+    drop.check_public_preview_text = spy
+    try:
+        fake = Fake(rows=[row("untitled", auth_mode="password")])
+        code, out, err = run_cli(["--public-preview", "--yes", str(page)], fake)
+    finally:
+        drop.check_public_preview_text = saved
+    assert code == 0, err
+    assert checked == ["Untitled", "Untitled 2"], checked
+    assert fake.manifests[0]["preview"]["title"] == "Untitled 2", fake.manifests[0]["preview"]
+    # When nothing changes, the values are checked once.
+    checked.clear()
+    drop.check_public_preview_text = spy
+    try:
+        code, out, err = run_cli(["--public-preview", "--yes", str(PAGE)], Fake())
+    finally:
+        drop.check_public_preview_text = saved
+    assert code == 0 and checked == ["Page"], (err, checked)
+
+
+class _PageRecorder(Fake):
+    """A Fake that keeps the staged index.html text as it goes up."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.pages = []
+
+    def upload_r2(self, files, slug):
+        super().upload_r2(files, slug)
+        self.pages.append(next(path for path, rel in files if rel == "index.html").read_text())
+
+
+def test_public_preview_carries_site_name_and_image_alt():
+    fake = _PageRecorder()
+    argv = ["--public-preview", "--card-site-name", 'Acme & "Co"', "--card-image-alt", "Title card <draft>",
+            "--yes", str(DESCRIBED)]
+    code, out, err = run_cli(argv, fake)
+    assert code == 0, err
+    preview = fake.manifests[0]["preview"]
+    assert preview["site_name"] == 'Acme & "Co"' and preview["image_alt"] == "Title card <draft>", preview
+    # The same values the staged page carries (escaped there, raw in the manifest).
+    page = fake.pages[0]
+    assert '<meta property="og:site_name" content="Acme &amp; &quot;Co&quot;">' in page, page
+    assert '<meta property="og:image:alt" content="Title card &lt;draft&gt;">' in page, page
+    assert '<meta name="twitter:image:alt" content="Title card &lt;draft&gt;">' in page, page
+    # Unset, they are sent as null and the page has no such tags.
+    fake = _PageRecorder()
+    code, out, err = run_cli(["--public-preview", "--yes", str(DESCRIBED)], fake)
+    assert code == 0, err
+    assert fake.manifests[0]["preview"]["site_name"] is None and fake.manifests[0]["preview"]["image_alt"] is None
+    assert "og:site_name" not in fake.pages[0] and "image:alt" not in fake.pages[0]
+
+
+def test_public_preview_site_name_and_alt_limits_count_utf16_units():
+    for flag in ("--card-site-name", "--card-image-alt"):
+        fake = Fake()
+        code, out, err = run_cli(["--public-preview", flag, "\U0001F600" * 151, "--yes", str(PAGE)], fake)
+        assert code == 1 and "302 characters" in err and f"shorter {flag}" in err, (flag, err)
+        assert "upload" not in fake.kinds() and not fake.manifests, fake.events
+        fake = Fake()
+        code, out, err = run_cli(["--public-preview", flag, "\U0001F600" * 150, "--yes", str(PAGE)], fake)
+        assert code == 0, err
 
 
 def test_update_public_preview_is_set_per_publish_not_inherited():

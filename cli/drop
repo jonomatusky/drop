@@ -877,24 +877,25 @@ def _layout_card_title(title: str, width: int = 1200, height: int = 630) -> tupl
     return 5, all_lines[:_OG_CARD_MAX_LINES], 8 * 5 + 10, len(all_lines) > _OG_CARD_MAX_LINES
 
 
-def card_title_warnings(title: str) -> list[str]:
+def card_title_problems(title: str) -> list[str]:
     """Where the generated card would not match the title it is meant to show:
     characters the bitmap font cannot draw (printable ASCII only; the rest become
-    "?"), or a title too long for the card's five lines."""
-    warnings: list[str] = []
+    "?"), or a title too long for the card's five lines. --public-preview refuses
+    on any of these, since the card and og:title are both public."""
+    problems: list[str] = []
     undrawable = sorted({ch for ch in "".join(title.split()) if not 0x20 <= ord(ch) <= 0x7E})
     if undrawable:
         shown = " ".join(repr(ch) for ch in undrawable[:8]) + (" ..." if len(undrawable) > 8 else "")
-        warnings.append(
-            f"--public-preview: the card image draws only plain ASCII, so {shown} in the title show as \"?\" "
-            "on og.png while og:title shows the real text; pass an ASCII --card-title to match"
+        problems.append(
+            f"the card image draws only plain ASCII, so {shown} in the title would show as \"?\" "
+            "on og.png while og:title shows the real text; pass an ASCII --card-title"
         )
     if _layout_card_title(title.strip())[3]:
-        warnings.append(
-            f"--public-preview: the title is too long for the card image, which shows only its first "
-            f"{_OG_CARD_MAX_LINES} lines; pass a shorter --card-title to match og:title"
+        problems.append(
+            f"the title is too long for the card image, which shows only its first "
+            f"{_OG_CARD_MAX_LINES} lines; pass a shorter --card-title"
         )
-    return warnings
+    return problems
 
 
 def render_og_card(
@@ -948,6 +949,10 @@ OG_DESCRIPTION_MAX = 300
 # counts UTF-16 code units (JavaScript's String.length), so check with
 # utf16_length, not len().
 PREVIEW_TITLE_MAX = 300
+# The Worker's caps on preview.site_name and preview.image_alt, in the same
+# UTF-16 units.
+PREVIEW_SITE_NAME_MAX = 300
+PREVIEW_IMAGE_ALT_MAX = 300
 
 
 def utf16_length(value: str) -> int:
@@ -1248,8 +1253,9 @@ def check_public_preview_tier(auth_mode: str, args: argparse.Namespace, slug: st
 
 
 def preview_payload(card_note: dict | None, file_rows: list[dict]) -> dict:
-    """The manifest's `preview` for --public-preview: the exact title and
-    description the staged card carries, plus the sha256 of the staged og.png.
+    """The manifest's `preview` for --public-preview: the exact title,
+    description, site name and image alt text the staged page carries, plus the
+    sha256 of the staged og.png.
     The Worker serves og.png without the password only while the stored object
     hashes to that value, so the exemption covers these exact card bytes and
     nothing else. Checked against the Worker's limits here, so a bad value
@@ -1269,7 +1275,90 @@ def preview_payload(card_note: dict | None, file_rows: list[dict]) -> dict:
             f"--public-preview: the card title is {units} characters (UTF-16 units) and the limit is "
             f"{PREVIEW_TITLE_MAX}; pass a shorter --card-title"
         )
-    return {"title": title, "description": card_note.get("description"), "image_sha256": card_row["sha256"]}
+    site_name = card_note.get("site_name") or None
+    image_alt = card_note.get("image_alt") or None
+    for flag, value, limit in (
+        ("--card-site-name", site_name, PREVIEW_SITE_NAME_MAX),
+        ("--card-image-alt", image_alt, PREVIEW_IMAGE_ALT_MAX),
+    ):
+        if value is not None and utf16_length(value) > limit:
+            raise PublishError(
+                f"--public-preview: {flag} is {utf16_length(value)} characters (UTF-16 units) and the limit is "
+                f"{limit}; pass a shorter {flag}"
+            )
+    return {
+        "title": title,
+        "description": card_note.get("description"),
+        "site_name": site_name,
+        "image_alt": image_alt,
+        "image_sha256": card_row["sha256"],
+    }
+
+
+def card_text(markup: str, args: argparse.Namespace, slug: str) -> tuple[str, str | None]:
+    """The card's title and description, as the staged page will carry them
+    (before the description is cut to OG_DESCRIPTION_MAX)."""
+    title = args.card_title or extract_title(markup) or args.client or args.label or _prettify_slug(slug)
+    description = args.card_description or extract_description(markup)
+    return title, description
+
+
+def public_preview_text(files: list[tuple[Path, str]], args: argparse.Namespace, slug: str) -> dict:
+    """The values --public-preview makes public, resolved the way the staged page
+    resolves them: title, description (cut as og:description cuts it), site name
+    and image alt text."""
+    entry = _entry_html(files)
+    markup = (read_html(next(path for path, rel in files if rel == entry)) if entry else None) or ""
+    title, description = card_text(markup, args, slug)
+    return {
+        "title": title,
+        "description": description[:OG_DESCRIPTION_MAX] if description else None,
+        "site_name": args.card_site_name or None,
+        "image_alt": args.card_image_alt or None,
+    }
+
+
+def check_public_preview_text(text: dict, args: argparse.Namespace) -> tuple[list[str], list[dict]]:
+    """Refuse a --public-preview whose public values would mislead or leak.
+
+    The card must draw the title it claims (see card_title_problems). Then the
+    PII scan the preflight runs over the files runs over the public values, after
+    HTML entity decoding, since a page title like `&#49;23-45-6789` reads as a
+    plain number in a chat preview. High-confidence findings block unless
+    --allow-pii, as in the preflight. Returns (warnings, override log entries)."""
+    problems = card_title_problems(text["title"])
+    if len(problems) == 1:
+        raise PublishError(f"--public-preview: {problems[0]}")
+    if problems:
+        raise PublishError("--public-preview:\n  - " + "\n  - ".join(problems))
+    high: list[str] = []
+    warn: list[str] = []
+    for field in ("title", "description", "site_name", "image_alt"):
+        value = text.get(field)
+        if not value:
+            continue
+        h, w = pii_scan_text(value + "\n" + html.unescape(value))
+        high.extend(f"{field}: {item}" for item in h)
+        warn.extend(f"{field}: {item}" for item in w)
+    warnings = [f"public preview {item}" for item in warn]
+    override_log: list[dict] = []
+    if high:
+        if not args.allow_pii:
+            raise PublishError(
+                "--public-preview: the link preview is public without the password, and it has "
+                "high-confidence PII:\n  - " + "\n  - ".join(high)
+                + "\nchange the text (--card-title, --card-description, --card-site-name, --card-image-alt) "
+                "or pass --allow-pii REASON"
+            )
+        override_log.append({
+            "type": "preview-pii",
+            "reason": args.allow_pii,
+            "actor": _actor(),
+            "host": socket.gethostname(),
+            "at": utc_now().isoformat(),
+        })
+        warnings.extend(f"public preview PII override: {item}" for item in high)
+    return warnings, override_log
 
 
 def resolve_card_image(image_arg: str, files: list[tuple[Path, str]]) -> tuple[Path, str, bool]:
@@ -1321,8 +1410,7 @@ def stage_publish_set(
     external_image: tuple[Path, str] | None = None
     meta: dict = {}
     if card:
-        title = args.card_title or extract_title(markup) or args.client or args.label or _prettify_slug(slug)
-        description = args.card_description or extract_description(markup)
+        title, description = card_text(markup, args, slug)
         page_url = f"{base}/{slug}/"
         if args.card_image:
             source, image_rel, external = resolve_card_image(args.card_image, files)
@@ -1340,10 +1428,6 @@ def stage_publish_set(
             fg = _parse_hex_color(args.card_fg, (232, 235, 242))
             accent = _parse_hex_color(args.card_accent, (122, 162, 255))
             png = render_og_card(title, f"{host}/{slug}", bg=bg, fg=fg, accent=accent)
-            if getattr(args, "public_preview", False):
-                # The card is public with this flag, so say when it would not
-                # show the same title as og:title. (No change without the flag.)
-                warnings.extend(card_title_warnings(title))
         image_url = f"{base}/{slug}/{urllib.parse.quote(image_rel)}"
         meta = {
             "title": title,
@@ -1359,6 +1443,8 @@ def stage_publish_set(
             "title": title,
             # As the page's og:description carries it; --public-preview sends this.
             "description": description[:OG_DESCRIPTION_MAX] if description else None,
+            "site_name": args.card_site_name or None,
+            "image_alt": args.card_image_alt or None,
             "image": image_url,
             "image_source": image_source,
             "entry": entry,
@@ -1696,7 +1782,6 @@ def publish_artifact(
     scan_result = preflight(path, scanned, args)
     if visibility:
         scan_result["visibility"] = visibility
-    public_confirm(args)
 
     in_place = bool(args.slug)
     label = args.client or args.label
@@ -1704,6 +1789,19 @@ def publish_artifact(
     # file/dir name (a file's extension is dropped — `report.html` -> `report`).
     base_name = path.stem if path.is_file() else path.name
     slug = args.slug or generated_slug(label or base_name, secret=args.unlisted)
+
+    # --public-preview makes the title, description, site name and alt text
+    # public. Check them before the confirmation, with the slug as it stands
+    # (only the title's last-resort slug fallback can change once the slug is
+    # made unique below, and that case is checked again after staging).
+    preview_text: dict | None = None
+    if args.public_preview:
+        preview_text = public_preview_text(files, args, slug)
+        preview_warnings, preview_overrides = check_public_preview_text(preview_text, args)
+        scan_result["warnings"].extend(preview_warnings)
+        scan_result["override_log"].extend(preview_overrides)
+    public_confirm(args)
+
     created_at = utc_now().isoformat()
     base = base_url()
 
@@ -1745,7 +1843,13 @@ def publish_artifact(
         if password:
             manifest["password_verifier"] = password_verifier(password)
         if args.public_preview:
-            manifest["preview"] = preview_payload(card_note, file_rows)
+            preview = preview_payload(card_note, file_rows)
+            final_text = {key: preview[key] for key in ("title", "description", "site_name", "image_alt")}
+            if final_text != preview_text:
+                preview_warnings, preview_overrides = check_public_preview_text(final_text, args)
+                scan_result["warnings"].extend(preview_warnings)
+                scan_result["override_log"].extend(preview_overrides)
+            manifest["preview"] = preview
 
         if args.dry_run:
             print(json.dumps({"dry_run": True, "url": f"{base}/{slug}/", "card": card_note, "manifest": manifest}, indent=2))
