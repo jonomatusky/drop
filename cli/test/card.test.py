@@ -159,6 +159,10 @@ class _Args:
     client = None
     label = None
     no_card = False
+    card_image = None
+    card_description = None
+    card_site_name = None
+    card_image_alt = None
 
 
 class _NoCardArgs(_Args):
@@ -243,5 +247,179 @@ with tempfile.TemporaryDirectory() as d:
         check("non-UTF-8 HTML is warned about", any("UTF-8" in w for w in warns))
     finally:
         tmp.cleanup()
+
+print("optional preview tags")
+src = "<html><head><title>T</title></head><body>hi</body></html>"
+out = drop.inject_og_meta(
+    src, title="T", description=None, image_url="https://h/s/hero.jpg", page_url="https://h/s/",
+    image_size=(800, 400), image_type="image/jpeg", image_alt='A "red" door', site_name="Tokyo Trip",
+)
+check("og:site_name written", 'property="og:site_name" content="Tokyo Trip"' in out)
+check("og:image:alt written and escaped", 'property="og:image:alt" content="A &quot;red&quot; door"' in out)
+check("twitter:image:alt written", 'name="twitter:image:alt" content="A &quot;red&quot; door"' in out)
+check("og:image:type written", 'property="og:image:type" content="image/jpeg"' in out)
+check("real width written", 'property="og:image:width" content="800"' in out)
+check("real height written", 'property="og:image:height" content="400"' in out)
+bare = drop.inject_og_meta(src, title="T", description=None, image_url="i", page_url="p", image_size=None)
+check("unknown size -> no og:image:width", "og:image:width" not in bare)
+check("unknown size -> no og:image:height", "og:image:height" not in bare)
+check("unset alt -> no alt tags", "image:alt" not in bare)
+check("unset site name -> no og:site_name", "og:site_name" not in bare)
+check("no type passed -> no og:image:type", "og:image:type" not in bare)
+default = drop.inject_og_meta(src, title="T", description=None, image_url="i", page_url="p")
+check("generated card keeps its 1200x630 tags", 'content="1200"' in default and 'content="630"' in default)
+
+
+def make_jpeg(width, height):
+    """A minimal JPEG header: SOI, APP0, a fill byte, DHT (a C4 marker that is
+    NOT a frame and must be skipped), then a progressive SOF2 frame."""
+    app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    dht = b"\xff\xc4" + struct.pack(">H", 5) + b"\x00\x00\x00"
+    sof2 = b"\xff\xc2" + struct.pack(">HBHHB", 11, 8, height, width, 1) + b"\x01\x11\x00"
+    return b"\xff\xd8" + app0 + b"\xff" + dht + sof2 + b"\xff\xd9"
+
+
+def make_gif(width, height):
+    return b"GIF89a" + struct.pack("<HH", width, height) + b"\x00\x00\x00;"
+
+
+def make_webp_vp8x(width, height):
+    payload = b"\x00\x00\x00\x00" + (width - 1).to_bytes(3, "little") + (height - 1).to_bytes(3, "little")
+    return b"RIFF" + struct.pack("<I", 4 + 8 + len(payload)) + b"WEBP" + b"VP8X" + struct.pack("<I", len(payload)) + payload
+
+
+print("image dimensions (stdlib header parsing)")
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d)
+    (root / "a.png").write_bytes(drop._png_encode(37, 21, bytearray(37 * 21 * 3)))
+    (root / "b.jpg").write_bytes(make_jpeg(1600, 900))
+    (root / "c.gif").write_bytes(make_gif(320, 240))
+    (root / "d.webp").write_bytes(make_webp_vp8x(1200, 628))
+    (root / "e.webp").write_bytes(b"RIFF\x00\x00\x00\x00WEBPjunkjunkjunk")
+    (root / "f.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00")  # truncated
+    (root / "g.png").write_bytes(b"not an image at all")
+    (root / "h.jpg").write_bytes(b"\xff\xd8\xff\xda\x00\x02")  # scan before any frame
+    check("PNG IHDR read", drop.image_dimensions(root / "a.png") == (37, 21))
+    check("JPEG SOF2 read past APP0, fill byte, and DHT", drop.image_dimensions(root / "b.jpg") == (1600, 900))
+    check("GIF header read", drop.image_dimensions(root / "c.gif") == (320, 240))
+    check("WebP VP8X canvas read", drop.image_dimensions(root / "d.webp") == (1200, 628))
+    check("unknown WebP chunk -> None", drop.image_dimensions(root / "e.webp") is None)
+    check("truncated JPEG -> None", drop.image_dimensions(root / "f.jpg") is None)
+    check("non-image bytes -> None", drop.image_dimensions(root / "g.png") is None)
+    check("JPEG with no frame header -> None", drop.image_dimensions(root / "h.jpg") is None)
+    check("missing file -> None", drop.image_dimensions(root / "nope.png") is None)
+
+
+def card_args(**overrides):
+    args = _Args()
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+print("custom card image: external file")
+with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outside:
+    root = Path(d)
+    (root / "trip.html").write_text('<html><head><title>Tokyo</title><meta name="description" content="page desc"></head><body>t</body></html>')
+    hero = Path(outside) / "Hero.JPG"
+    hero.write_bytes(make_jpeg(1600, 900))
+    files = [(root / "trip.html", "trip.html")]
+    args = card_args(card_image=str(hero), card_description="Ten days in Tokyo", card_site_name="Trips", card_image_alt="Shibuya at night")
+    staged, tmp, note, warns = drop.stage_publish_set(files, "tokyo", "https://drop.example.com", args)
+    try:
+        rels = sorted(rel for _, rel in staged)
+        check("single HTML still renamed to index.html with an external image", rels == ["index.html", "og.jpg"])
+        check("no generated og.png alongside a custom image", "og.png" not in rels)
+        page = next(p for p, rel in staged if rel == "index.html").read_text()
+        check("og:image points at the staged og.jpg", 'property="og:image" content="https://drop.example.com/tokyo/og.jpg"' in page)
+        check("og:image:type is image/jpeg", 'content="image/jpeg"' in page)
+        check("real JPEG dims written", 'property="og:image:width" content="1600"' in page and 'property="og:image:height" content="900"' in page)
+        check("--card-description overrides the page description", 'property="og:description" content="Ten days in Tokyo"' in page and "page desc" not in page.split(drop._OG_BLOCK_END)[0].split(drop._OG_BLOCK_START)[1])
+        check("og:site_name from --card-site-name", 'property="og:site_name" content="Trips"' in page)
+        check("og:image:alt from --card-image-alt", 'property="og:image:alt" content="Shibuya at night"' in page)
+        check("staged image bytes are the source bytes", (Path(tmp.name) / "og.jpg").read_bytes() == hero.read_bytes())
+        check("card note reports the image actually used", note["image"] == "https://drop.example.com/tokyo/og.jpg" and note["image_source"] == "staged")
+    finally:
+        tmp.cleanup()
+
+print("custom card image: inside the artifact")
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d)
+    (root / "index.html").write_text("<html><head><title>T</title></head><body>x</body></html>")
+    (root / "img").mkdir()
+    (root / "img" / "hero.gif").write_bytes(make_gif(640, 320))
+    files = drop.iter_files(root)
+    staged, tmp, note, warns = drop.stage_publish_set(files, "site", "https://drop.example.com", card_args(card_image=str(root / "img" / "hero.gif")))
+    try:
+        rels = sorted(rel for _, rel in staged)
+        check("in-artifact image is referenced, not copied", rels == ["img/hero.gif", "index.html"])
+        page = next(p for p, rel in staged if rel == "index.html").read_text()
+        check("og:image points at the existing rel", 'property="og:image" content="https://drop.example.com/site/img/hero.gif"' in page)
+        check("GIF dims written", 'property="og:image:width" content="640"' in page)
+        check("card note marks the artifact source", note["image_source"] == "artifact")
+    finally:
+        tmp.cleanup()
+
+print("custom card image: unreadable size")
+with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outside:
+    root = Path(d)
+    (root / "index.html").write_text("<html><head><title>T</title></head><body>x</body></html>")
+    odd = Path(outside) / "odd.webp"
+    odd.write_bytes(b"RIFF\x00\x00\x00\x00WEBPjunkjunkjunk")
+    staged, tmp, note, warns = drop.stage_publish_set([(root / "index.html", "index.html")], "s", "https://drop.example.com", card_args(card_image=str(odd)))
+    try:
+        page = next(p for p, rel in staged if rel == "index.html").read_text()
+        check("unknown dims -> no og:image:width/height", "og:image:width" not in page and "og:image:height" not in page)
+        check("unknown dims -> warned", any("size unreadable" in w for w in warns))
+        check("webp type still declared", 'content="image/webp"' in page)
+    finally:
+        tmp.cleanup()
+
+print("custom card image: collision with an artifact file")
+with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outside:
+    root = Path(d)
+    (root / "index.html").write_text("<html><head><title>T</title></head><body>x</body></html>")
+    (root / "og.jpg").write_bytes(make_jpeg(10, 10))
+    other = Path(outside) / "other.jpg"
+    other.write_bytes(make_jpeg(20, 20))
+    try:
+        drop.resolve_card_image(str(other), drop.iter_files(root))
+        check("external image refused when og.<ext> is taken", False)
+    except drop.PublishError as err:
+        check("external image refused when og.<ext> is taken", "og.jpg" in str(err))
+    try:
+        drop.stage_publish_set(drop.iter_files(root), "s", "https://drop.example.com", card_args(card_image=str(other)))
+        check("staging refuses the collision too", False)
+    except drop.PublishError:
+        check("staging refuses the collision too", True)
+    # The artifact's own og.jpg is fine: it is referenced in place.
+    _, rel, external = drop.resolve_card_image(str(root / "og.jpg"), drop.iter_files(root))
+    check("the artifact's own og.jpg is not a collision", rel == "og.jpg" and not external)
+
+print("card flag conflicts (check_card_flags)")
+with tempfile.TemporaryDirectory() as outside:
+    img = Path(outside) / "hero.png"
+    img.write_bytes(drop._png_encode(2, 2, bytearray(12)))
+    bad = Path(outside) / "hero.svg"
+    bad.write_text("<svg/>")
+
+    def refused_flags(argv, needle):
+        args = drop.build_parser().parse_args(argv + ["x.html"])
+        try:
+            drop.check_card_flags(args)
+        except drop.PublishError as err:
+            return needle in str(err)
+        return False
+
+    for flag, value in (("--card-image", str(img)), ("--card-description", "d"), ("--card-site-name", "s"), ("--card-image-alt", "a")):
+        check(f"{flag} refused with --no-card", refused_flags(["--no-card", flag, value], "--no-card"))
+    for flag in ("--card-bg", "--card-fg", "--card-accent"):
+        check(f"{flag} refused with --card-image", refused_flags(["--card-image", str(img), flag, "#000000"], flag))
+    check("--card-image .svg refused", refused_flags(["--card-image", str(bad)], ".png"))
+    check("--card-image missing file refused", refused_flags(["--card-image", str(Path(outside) / "none.png")], "not found"))
+    ok_args = drop.build_parser().parse_args(["--card-image", str(img), "--card-title", "T", "--card-image-alt", "a", "x.html"])
+    drop.check_card_flags(ok_args)
+    check("--card-image with title and alt is accepted", True)
+    check("colors alone still accepted", not refused_flags(["--card-bg", "#000000"], ""))
 
 print(f"\n{passed} checks passed")
