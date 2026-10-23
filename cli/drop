@@ -1303,11 +1303,24 @@ def card_text(markup: str, args: argparse.Namespace, slug: str) -> tuple[str, st
     return title, description
 
 
+def check_preview_entry_decodes(files: list[tuple[Path, str]]) -> str | None:
+    """The entry page's rel, refusing --public-preview when it is not UTF-8.
+    Staging publishes a page it cannot decode byte-for-byte, with no preview
+    meta, so the public preview would not match the page behind the gate."""
+    entry = _entry_html(files)
+    if entry and read_html(next(path for path, rel in files if rel == entry)) is None:
+        raise PublishError(
+            f"--public-preview needs {entry} to be UTF-8 so its preview can be written into it; "
+            "re-save it as UTF-8, or drop --public-preview"
+        )
+    return entry
+
+
 def public_preview_text(files: list[tuple[Path, str]], args: argparse.Namespace, slug: str) -> dict:
     """The values --public-preview makes public, resolved the way the staged page
     resolves them: title, description (cut as og:description cuts it), site name
     and image alt text."""
-    entry = _entry_html(files)
+    entry = check_preview_entry_decodes(files)
     markup = (read_html(next(path for path, rel in files if rel == entry)) if entry else None) or ""
     title, description = card_text(markup, args, slug)
     return {
@@ -1771,6 +1784,8 @@ def publish_artifact(
         raise PublishError(
             f"--public-preview serves the generated card at og.png, and {path.name} already has an og.png; rename it"
         )
+    if args.public_preview and _html_files(files):
+        check_preview_entry_decodes(files)
     # An external --card-image is published too, so it gets the same filename,
     # PII, and OCR scans as the artifact's own files. (Only when there is HTML
     # to carry the preview; otherwise nothing is staged and nothing uploads.)

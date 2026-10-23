@@ -149,7 +149,7 @@ class DB {
           const [slug, label, auth_mode, sha256, files_json, bytes, scan_result_json, created_at, expires_at, uploader] = this.values;
           self.upserts.push(slug);
           const prior = self.rows[slug];
-          self.rows[slug] = {
+          const incoming = {
             slug,
             label,
             auth_mode,
@@ -157,11 +157,21 @@ class DB {
             files_json,
             bytes,
             scan_result_json,
-            created_at: prior ? prior.created_at : created_at,
+            created_at,
             expires_at,
             revoked_at: null,
             uploader,
           };
+          if (!prior) {
+            self.rows[slug] = incoming;
+          } else {
+            // Honor the real upsert's SET list, so a column dropped from
+            // `ON CONFLICT ... DO UPDATE SET` keeps its old value here too.
+            const updated = { ...prior };
+            for (const [, column] of sql.matchAll(/(\w+)\s*=\s*excluded\.\1\b/g)) updated[column] = incoming[column];
+            if (/revoked_at\s*=\s*NULL/.test(sql)) updated.revoked_at = null;
+            self.rows[slug] = updated;
+          }
         }
         if (sql.includes("INSERT INTO audit_events")) {
           self.audit.push({

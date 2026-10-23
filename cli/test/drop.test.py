@@ -765,6 +765,16 @@ def test_public_preview_refused_without_html():
     refused(["--public-preview", "--yes", _pdf()], Fake(), "--public-preview needs an HTML page")
 
 
+def test_public_preview_refused_when_the_entry_page_is_not_utf8():
+    # Staging publishes an undecodable page verbatim with no preview meta, so the
+    # public preview could not match it.
+    page = Path(_ARTIFACTS.name) / "cp1252.html"
+    page.write_bytes("<html><head><title>Café</title></head></html>".encode("cp1252"))
+    fake = Fake()
+    refused(["--public-preview", "--yes", str(page)], fake, "needs cp1252.html to be UTF-8")
+    assert not fake.uploads, fake.uploads
+
+
 def test_public_preview_refused_when_artifact_has_its_own_og_png():
     site = Path(_ARTIFACTS.name) / "site-with-og"
     site.mkdir(exist_ok=True)
