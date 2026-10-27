@@ -105,6 +105,16 @@ class PublishError(Exception):
     pass
 
 
+class AdminAPIError(PublishError):
+    """An HTTP error answer from the Worker's admin API, with its status and body
+    kept so a caller can recognize a specific refusal."""
+
+    def __init__(self, message: str, status: int, body: str):
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
+
 class AssetParser(html.parser.HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -513,8 +523,8 @@ def admin_request(method: str, path: str, token: str, payload: dict | None = Non
             body = resp.read().decode()
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as err:
-        body = err.read().decode(errors="ignore")
-        raise PublishError(f"admin API {method} {path} -> HTTP {err.code}: {body.strip() or '<empty>'}") from err
+        body = err.read().decode(errors="ignore").strip()
+        raise AdminAPIError(f"admin API {method} {path} -> HTTP {err.code}: {body or '<empty>'}", err.code, body) from err
     except urllib.error.URLError as err:
         raise PublishError(f"admin API unavailable: {err}") from err
 
@@ -1391,7 +1401,7 @@ def check_unlisted_republish(slug: str, row: dict | None) -> None:
     if mode == "password":
         raise PublishError(
             f"{slug} is a password share; republishing it --unlisted would remove its password. "
-            f"Use `drop update {slug} --password <its password> <path>` to keep the tier"
+            f"Use `drop update {slug} <path>` to keep the tier and its password"
         )
     if mode != "public":
         raise PublishError(f"{slug} has an unknown auth_mode {mode!r}; refusing to guess its tier")
@@ -1420,19 +1430,18 @@ def check_update_target(slug: str, row: dict | None, args: argparse.Namespace) -
     if share_expired(row) and not args.expire:
         raise PublishError(f"{slug} expired at {row['expires_at']}; pass --expire to republish it with a new expiry")
     mode = row.get("auth_mode")
-    if mode == "password" and not args.password:
-        # The Worker's manifest upsert requires a verifier for a password share
-        # and has no way to keep the stored one, so update can't carry the old
-        # password over. Minting a fresh one would lock out everyone who has it.
-        raise PublishError(
-            f"{slug} is a password share: pass its password with --password. Without it, update would have "
-            "to mint a new one and lock out everyone who has the current one. Recipients will still see the "
-            "login page once more, because the stored verifier is re-salted on every publish"
-        )
     if mode == "public" and args.password:
         raise PublishError(f"{slug} has no password, and update keeps the tier; drop --password")
     if mode not in ("password", "public"):
         raise PublishError(f"{slug} has an unknown auth_mode {mode!r}; refusing to guess its tier")
+
+
+def check_password_flag(args: argparse.Namespace) -> None:
+    """Refuse an explicitly empty --password, as from an unset shell variable.
+    Treated as absent, it would quietly keep the old password on update, or mint
+    a random one on publish, when the caller meant to set this one."""
+    if args.password is not None and not args.password:
+        raise PublishError("--password is empty; pass a password, or omit --password")
 
 
 def inherited_expiry(row: dict | None, args: argparse.Namespace) -> tuple[str | None, str | None]:
@@ -1460,6 +1469,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
     # isn't. (--public/--unlisted are already mutually exclusive via argparse.)
     if (args.public or args.unlisted) and args.password:
         raise PublishError("--password has no effect on --public/--unlisted shares (those tiers have no password); drop one")
+    check_password_flag(args)
     check_card_flags(args)
 
     # Three visibility tiers (YouTube-style):
@@ -1503,6 +1513,7 @@ def cmd_update(slug: str, args: argparse.Namespace) -> None:
     for flag, value in (("--public", args.public), ("--unlisted", args.unlisted), ("--slug", args.slug)):
         if value:
             raise PublishError(f"{flag} has no place in `drop update`: the slug and tier are inherited from the share")
+    check_password_flag(args)
     check_card_flags(args)
 
     token = admin_token()
@@ -1514,12 +1525,15 @@ def cmd_update(slug: str, args: argparse.Namespace) -> None:
         args.label = row["label"]
     expires_at, _ = inherited_expiry(row, args)
     args.slug = slug
+    is_password = row["auth_mode"] == "password"
     publish_artifact(
         args,
         auth_mode=row["auth_mode"],
-        # check_update_target guarantees --password on a password share; update
-        # never mints one.
-        password=args.password if row["auth_mode"] == "password" else None,
+        # A password share keeps its stored verifier unless --password sets a
+        # new one. Update never mints a password: a fresh one would lock out
+        # everyone who has the current one.
+        password=args.password if is_password else None,
+        keep_password=is_password and not args.password,
         expires_at=expires_at,
         token=token,
         notes=[],
@@ -1539,13 +1553,16 @@ def publish_artifact(
     token: str | None,
     notes: list[str],
     visibility: str | None,
+    keep_password: bool = False,
 ) -> None:
     """The one publish path behind both `drop <path>` and `drop update`: scan,
     stage, upload, write the manifest, and (for a republish) purge stale files.
 
     ``args.slug`` set means an in-place republish onto that exact slug; unset
     means a fresh share whose slug is derived and made unique here. The caller
-    has already settled the tier, password, and expiry."""
+    has already settled the tier, password, and expiry. ``keep_password`` asks
+    the Worker to keep a password share's stored verifier instead of taking a
+    new one, so its password and recipients' login cookies still work."""
     path = Path(args.path).expanduser().resolve()
     files = iter_files(path)
     if not args.no_card and not _html_files(files):
@@ -1622,13 +1639,20 @@ def publish_artifact(
         }
         if password:
             manifest["password_verifier"] = password_verifier(password)
+        elif keep_password:
+            manifest["keep_password_verifier"] = True
 
         if args.dry_run:
             print(json.dumps({"dry_run": True, "url": f"{base}/{slug}/", "card": card_note, "manifest": manifest}, indent=2))
             return
 
         upload_r2(published, slug)
-        admin_request("POST", "/admin/manifest", token, manifest)
+        try:
+            admin_request("POST", "/admin/manifest", token, manifest)
+        except AdminAPIError as err:
+            if keep_password and err.status == 400:
+                explain_keep_refusal(slug, err)
+            raise
     finally:
         if card_tmp is not None:
             card_tmp.cleanup()
@@ -1661,6 +1685,8 @@ def publish_artifact(
         print(f"card: {card_note['image']}")
     if password:
         print(f"password: {password}")
+    elif keep_password:
+        print("password kept: the existing password and logins still work")
     if expires_at:
         print(f"expires: {expires_at}")
     if purged:
@@ -1670,6 +1696,26 @@ def publish_artifact(
         print("warnings:", file=sys.stderr)
         for warning in warnings:
             print(f"  - {warning}", file=sys.stderr)
+
+
+def explain_keep_refusal(slug: str, err: AdminAPIError) -> None:
+    """Turn the Worker's refusal of a keep_password_verifier manifest into a
+    plain reason. Returns when the refusal is some other 400."""
+    if err.body == "no existing password to keep":
+        # drop update checked the row first, so the share changed after that
+        # lookup, or its stored verifier is gone.
+        raise PublishError(
+            f"the Worker refused to update {slug}: it has no stored password to keep. The share may have "
+            f"been removed or changed since the lookup. The new files were already uploaded under {slug}/, "
+            f"so its old record may serve some of them; check `drop list`, or rerun with --password to set a new one"
+        ) from err
+    if err.body == "missing password_verifier":
+        # A Worker from before keep_password_verifier ignores the flag.
+        raise PublishError(
+            f"the Worker at {base_url()} cannot keep a stored password, so {slug} was not updated. The new "
+            f"files were already uploaded under {slug}/, so its old record may serve some of them. Deploy the "
+            f"current worker/, or rerun with --password to set the password again (recipients will need to log in again)"
+        ) from err
 
 
 def cmd_list(_: argparse.Namespace) -> None:
@@ -1755,7 +1801,7 @@ def build_parser(prog: str = "drop") -> argparse.ArgumentParser:
     visibility = parser.add_mutually_exclusive_group()
     visibility.add_argument("--public", action="store_true", help="truly public: no password, clean guessable URL (discoverable)")
     visibility.add_argument("--unlisted", action="store_true", help="secret link: no password, unguessable URL — share the link directly")
-    parser.add_argument("--password", help="set an explicit password instead of generating one (password tier only)")
+    parser.add_argument("--password", help="set an explicit password instead of generating one (password tier only); with update, set a new password instead of keeping the current one")
     parser.add_argument("--expire", type=parse_duration, help="server-side expiry duration, e.g. 7d")
     # Link-preview (OpenGraph/Twitter) card. Generated for HTML shares so a shared
     # URL renders a landscape card instead of a tall page screenshot.
