@@ -421,5 +421,130 @@ with tempfile.TemporaryDirectory() as outside:
     drop.check_card_flags(ok_args)
     check("--card-image with title and alt is accepted", True)
     check("colors alone still accepted", not refused_flags(["--card-bg", "#000000"], ""))
+    check("--public-preview refused with --no-card", refused_flags(["--public-preview", "--no-card"], "--no-card"))
+    check("--public-preview refused with --card-image",
+          refused_flags(["--public-preview", "--card-image", str(img)], "only the generated title card"))
+    check("--public-preview with card text and colors accepted",
+          not refused_flags(["--public-preview", "--card-title", "T", "--card-description", "d", "--card-bg", "#000000"], ""))
+
+print("public preview payload (preview_payload)")
+SHA = "0" * 64
+CARD_ROWS = [{"path": "index.html", "sha256": "1" * 64}, {"path": "og.png", "sha256": SHA}]
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d)
+    (root / "index.html").write_text('<html><head><title>Doc</title><meta name="description" content="Page desc"></head></html>')
+    files = [(root / "index.html", "index.html")]
+    staged, tmp, note, _ = drop.stage_publish_set(files, "s", "https://drop.example.com", _Args())
+    try:
+        _, _, rows = drop.digest_files(staged)
+        og_sha = next(r["sha256"] for r in rows if r["path"] == "og.png")
+        og_bytes = next(p for p, rel in staged if rel == "og.png").read_bytes()
+        check("card note carries the page description", note["description"] == "Page desc")
+        check("preview payload is the note's title and description, bound to the staged og.png",
+              drop.preview_payload(note, rows)
+              == {"title": "Doc", "description": "Page desc", "site_name": None, "image_alt": None, "image_sha256": og_sha})
+        check("image_sha256 is the sha256 of the staged card bytes",
+              og_sha == __import__("hashlib").sha256(og_bytes).hexdigest())
+    finally:
+        tmp.cleanup()
+    staged, tmp, note, _ = drop.stage_publish_set(
+        files, "s", "https://drop.example.com",
+        card_args(card_title="T", card_description="D", card_site_name="Acme & Co", card_image_alt="A title card"))
+    try:
+        _, _, rows = drop.digest_files(staged)
+        check("overrides reach the preview payload",
+              {k: v for k, v in drop.preview_payload(note, rows).items() if k != "image_sha256"}
+              == {"title": "T", "description": "D", "site_name": "Acme & Co", "image_alt": "A title card"})
+        page = next(p for p, rel in staged if rel == "index.html").read_text()
+        check("the staged page carries the same site name and alt text",
+              '<meta property="og:site_name" content="Acme &amp; Co">' in page
+              and '<meta property="og:image:alt" content="A title card">' in page
+              and '<meta name="twitter:image:alt" content="A title card">' in page)
+    finally:
+        tmp.cleanup()
+
+    def payload_refused(note, needle, rows=CARD_ROWS):
+        try:
+            drop.preview_payload(note, rows)
+        except drop.PublishError as err:
+            return needle in str(err)
+        return False
+
+    check("no card note refused", payload_refused(None, "og.png"))
+    check("a custom image note refused", payload_refused({"title": "T", "image_source": "staged"}, "og.png"))
+    check("no og.png row refused", payload_refused({"title": "T", "image_source": "generated"}, "og.png", rows=CARD_ROWS[:1]))
+    check("a blank title refused", payload_refused({"title": "  ", "image_source": "generated"}, "--card-title"))
+    check("a BOM-only title refused (JavaScript's trim() strips it)",
+          payload_refused({"title": "﻿ ", "image_source": "generated"}, "--card-title"))
+    check("a 301-char title refused", payload_refused({"title": "x" * 301, "image_source": "generated"}, "300"))
+    check("a 300-char title accepted",
+          drop.preview_payload({"title": "x" * 300, "image_source": "generated"}, CARD_ROWS)["title"] == "x" * 300)
+    # The Worker counts UTF-16 code units (String.length), not code points.
+    check("utf16_length counts an emoji as two units", drop.utf16_length("\U0001F600") == 2)
+    check("utf16_length counts a BMP letter as one unit", drop.utf16_length("é") == 1)
+    check("150 emoji (300 units) accepted",
+          drop.preview_payload({"title": "\U0001F600" * 150, "image_source": "generated"}, CARD_ROWS)["title"] == "\U0001F600" * 150)
+    check("151 emoji (151 code points, 302 units) refused before upload",
+          payload_refused({"title": "\U0001F600" * 151, "image_source": "generated"}, "302 characters"))
+    check("300 accented letters (BMP, 300 units) accepted",
+          drop.preview_payload({"title": "é" * 300, "image_source": "generated"}, CARD_ROWS)["title"] == "é" * 300)
+    # Site name and alt text: the same 300-unit caps as the Worker, string or null.
+    for key, flag in (("site_name", "--card-site-name"), ("image_alt", "--card-image-alt")):
+        base = {"title": "T", "image_source": "generated"}
+        check(f"{key}: 300 units accepted",
+              drop.preview_payload({**base, key: "\U0001F600" * 150}, CARD_ROWS)[key] == "\U0001F600" * 150)
+        check(f"{key}: 151 emoji (302 units) refused", payload_refused({**base, key: "\U0001F600" * 151}, f"shorter {flag}"))
+        check(f"{key}: 301 ASCII refused", payload_refused({**base, key: "x" * 301}, "301 characters"))
+        check(f"{key}: empty is sent as null", drop.preview_payload({**base, key: ""}, CARD_ROWS)[key] is None)
+        check(f"{key}: missing is sent as null", drop.preview_payload(base, CARD_ROWS)[key] is None)
+
+print("public preview: card title problems")
+check("an ASCII title that fits has no problems", drop.card_title_problems("Project proposal") == [])
+problems = drop.card_title_problems("Café plan \U0001F600")
+check("a non-ASCII title is one problem", len(problems) == 1)
+check("the problem names the undrawable characters", "'é'" in problems[0] and "'\U0001F600'" in problems[0])
+check("the problem says they show as ? and asks for an ASCII --card-title",
+      '"?"' in problems[0] and "og:title" in problems[0] and "ASCII --card-title" in problems[0])
+check("whitespace (tabs, newlines, NBSP) is not undrawable", drop.card_title_problems("A\tB\nC\u00a0D") == [])
+long_title = " ".join(["word"] * 120)
+check("the renderer clips this title", drop._layout_card_title(long_title)[3] is True)
+long_problems = drop.card_title_problems(long_title)
+check("a clipped title is a problem",
+      len(long_problems) == 1 and "too long" in long_problems[0] and "5 lines" in long_problems[0]
+      and "shorter --card-title" in long_problems[0])
+# At the smallest scale a line holds 26 characters: five "word"s, five lines.
+check("a title that just fits five lines is not clipped",
+      drop._layout_card_title(" ".join(["word"] * 25))[3] is False and drop.card_title_problems(" ".join(["word"] * 25)) == [])
+check("one more word is clipped", drop._layout_card_title(" ".join(["word"] * 26))[3] is True)
+check("both problems are both listed", len(drop.card_title_problems("é " + long_title)) == 2)
+# The layout helper is what the renderer uses: same scale and lines as before.
+check("layout picks the largest scale for a short title", drop._layout_card_title("Hi")[0] == 11)
+
+
+def text_refused(text, needle, **arg_overrides):
+    args = card_args(allow_pii=None, **arg_overrides)
+    try:
+        drop.check_public_preview_text({"description": None, "site_name": None, "image_alt": None, **text}, args)
+    except drop.PublishError as err:
+        return needle in str(err)
+    return False
+
+
+check("check_public_preview_text refuses an undrawable title", text_refused({"title": "Café"}, "ASCII --card-title"))
+check("check_public_preview_text refuses a clipped title", text_refused({"title": long_title}, "shorter --card-title"))
+check("check_public_preview_text lists both problems", text_refused({"title": "é " + long_title}, "\n  - the title is too long"))
+
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d)
+    (root / "index.html").write_text('<html><head><meta charset="utf-8"><title>Café</title></head></html>')
+    files = [(root / "index.html", "index.html")]
+    # Staging no longer warns about the card title: --public-preview refuses
+    # before staging instead, and without the flag nothing changes.
+    for args in (_Args(), card_args(public_preview=True)):
+        staged, tmp, note, warns = drop.stage_publish_set(files, "s", "https://drop.example.com", args)
+        tmp.cleanup()
+        check("staging adds no card-title warning", not any("ASCII" in w or "too long" in w for w in warns))
+    check("public_preview_text resolves the title the staged card uses",
+          drop.public_preview_text(files, _Args(), "s")["title"] == "Café")
 
 print(f"\n{passed} checks passed")
