@@ -27,18 +27,22 @@ class KV {
     this.map = new Map(Object.entries(seed));
     // Every write, in order, so a test can assert that none happened.
     this.writes = [];
+    this.puts = [];
+    this.deletes = [];
   }
   async get(key, opts = {}) {
     const value = this.map.get(key);
     if (value === undefined) return null;
     return opts.type === "json" ? JSON.parse(value) : value;
   }
-  async put(key, value) {
+  async put(key, value, options) {
     this.writes.push(["put", key]);
+    this.puts.push({ key, value, options });
     this.map.set(key, value);
   }
   async delete(key) {
     this.writes.push(["delete", key]);
+    this.deletes.push(key);
     this.map.delete(key);
   }
 }
@@ -215,8 +219,144 @@ async function envFor(rows, kvSeed = {}) {
   };
 }
 
+function manifestPayload(overrides = {}) {
+  return {
+    slug: "s1",
+    auth_mode: "password",
+    sha256: "updated-sha",
+    files: [{ path: "index.html", bytes: 2, sha256: "updated-sha" }],
+    bytes: 2,
+    scan_result: { clean: true },
+    created_at: "2026-10-23T00:00:00+00:00",
+    uploader: "test-publisher",
+    ...overrides,
+  };
+}
+
+function manifestRequest(payload) {
+  return new Request("https://share.example.test/admin/manifest", {
+    method: "POST",
+    headers: { authorization: "Bearer admin", "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
 const auth = `Basic ${Buffer.from("user:pw").toString("base64")}`;
 const badAuth = `Basic ${Buffer.from("user:wrong").toString("base64")}`;
+
+// === Manifest republish: retain an existing password verifier ===
+
+{
+  const oldVerifier = await verifier("pw");
+  const serializedVerifier = JSON.stringify(oldVerifier);
+  const env = await envFor(
+    { s1: row("s1") },
+    { "auth:s1": serializedVerifier, "deny:s1": "1" },
+  );
+  const oldCookie = await shareCookieToken(env, "s1", oldVerifier);
+
+  const res = await fetchHandler(manifestRequest(manifestPayload({ keep_password_verifier: true })), env);
+  assert.equal(res.status, 200);
+  assert.equal(env.AUTH_KV.map.get("auth:s1"), serializedVerifier, "the existing verifier remains byte-for-byte unchanged");
+  assert.equal(
+    env.AUTH_KV.puts.filter(({ key }) => key === "auth:s1").length,
+    0,
+    "the keep path must not rewrite the verifier",
+  );
+  assert.equal(env.AUTH_KV.map.has("deny:s1"), false, "successful republish still clears the deny marker");
+
+  const publish = env.DB.audit.find((event) => event.event === "publish");
+  assert.ok(publish, "successful republish still writes the publish audit event");
+  assert.deepEqual(JSON.parse(publish.details_json), {
+    auth_mode: "password",
+    bytes: 2,
+    files: ["index.html"],
+    scan_result: { clean: true },
+    override_log: [],
+    preview: false,
+    kept_password_verifier: true,
+  }, "the existing audit details are preserved and the keep path is marked");
+
+  const followup = await fetchHandler(
+    new Request("https://share.example.test/s1/", { headers: { cookie: `drop_auth=${oldCookie}` } }),
+    env,
+  );
+  assert.equal(followup.status, 200);
+  assert.equal(await followup.text(), "<h1>ok</h1>", "a cookie bound to the retained verifier remains valid");
+}
+
+{
+  const existingVerifier = JSON.stringify(await verifier("pw"));
+  const refusalCases = [
+    {
+      name: "existing public share",
+      rows: { s1: row("s1", { auth_mode: "public" }) },
+      kv: { "auth:s1": existingVerifier, "deny:s1": "1" },
+    },
+    {
+      name: "missing D1 row",
+      rows: {},
+      kv: { "auth:s1": existingVerifier, "deny:s1": "1" },
+    },
+    {
+      name: "missing KV verifier",
+      rows: { s1: row("s1") },
+      kv: { "deny:s1": "1" },
+    },
+  ];
+
+  for (const testCase of refusalCases) {
+    const env = await envFor(testCase.rows, testCase.kv);
+    const res = await fetchHandler(manifestRequest(manifestPayload({ keep_password_verifier: true })), env);
+    assert.equal(res.status, 400, testCase.name);
+    assert.equal(await res.text(), "no existing password to keep\n", testCase.name);
+    assert.equal(env.AUTH_KV.map.get("deny:s1"), "1", `${testCase.name}: refusal leaves deny state unchanged`);
+    assert.equal(env.DB.audit.length, 0, `${testCase.name}: refusal writes no audit event`);
+  }
+}
+
+{
+  const env = await envFor({ s1: row("s1") }, { "deny:s1": "1" });
+  const res = await fetchHandler(manifestRequest(manifestPayload()), env);
+  assert.equal(res.status, 400);
+  assert.equal(await res.text(), "missing password_verifier\n", "the existing missing-verifier error is unchanged without the keep flag");
+  assert.equal(env.AUTH_KV.map.get("deny:s1"), "1");
+  assert.equal(env.DB.audit.length, 0);
+}
+
+{
+  const newVerifier = await verifier("new-password");
+  const env = await envFor(
+    { s1: row("s1", { auth_mode: "public" }) },
+    { "auth:s1": JSON.stringify(await verifier("old-password")), "deny:s1": "1" },
+  );
+  const res = await fetchHandler(manifestRequest(manifestPayload({
+    keep_password_verifier: true,
+    password_verifier: newVerifier,
+  })), env);
+  assert.equal(res.status, 200, "a supplied verifier takes precedence over the keep flag");
+  assert.equal(env.AUTH_KV.map.get("auth:s1"), JSON.stringify(newVerifier));
+  assert.equal(env.AUTH_KV.puts.filter(({ key }) => key === "auth:s1").length, 1);
+  assert.equal(env.AUTH_KV.map.has("deny:s1"), false);
+  const details = JSON.parse(env.DB.audit.find((event) => event.event === "publish").details_json);
+  assert.equal(Object.hasOwn(details, "kept_password_verifier"), false, "audit marks only the actual keep path");
+}
+
+{
+  const env = await envFor(
+    { s1: row("s1", { auth_mode: "public" }) },
+    { "auth:s1": JSON.stringify(await verifier("old-password")), "deny:s1": "1" },
+  );
+  const res = await fetchHandler(manifestRequest(manifestPayload({
+    auth_mode: "public",
+    keep_password_verifier: true,
+  })), env);
+  assert.equal(res.status, 200, "public publishing behavior is unchanged when the irrelevant flag is present");
+  assert.equal(env.AUTH_KV.map.has("auth:s1"), false);
+  assert.equal(env.AUTH_KV.map.has("deny:s1"), false);
+  const details = JSON.parse(env.DB.audit.find((event) => event.event === "publish").details_json);
+  assert.equal(Object.hasOwn(details, "kept_password_verifier"), false);
+}
 
 {
   const env = await envFor({ s1: row("s1") }, { "auth:s1": JSON.stringify(await verifier("pw")) });
@@ -466,6 +606,19 @@ assert.equal(constantTimeEqual("same", "diff"), false);
   assert.doesNotMatch(body, /<h1>ok<\/h1>/, "login page must not leak the document");
   assert.equal(res.headers.get("x-robots-tag"), "noindex");
   assert.equal(res.headers.get("www-authenticate"), null, "no Basic-Auth dialog challenge");
+}
+
+{
+  // The login page must fit a phone. iOS Safari zooms into inputs under 16px on
+  // focus and leaves the page scrolling sideways; 100vh overshoots the visible
+  // area under Safari's toolbars; an unbroken label can push the card wide.
+  const env = await envFor({ s1: row("s1") }, { "auth:s1": JSON.stringify(await verifier("pw")) });
+  const body = await (await fetchHandler(new Request("https://share.example.test/s1/"), env)).text();
+  assert.match(body, /<meta name="viewport" content="width=device-width,\s*initial-scale=1"/);
+  assert.match(body, /@media\s*\(pointer:\s*coarse\)\s*\{[^}]*input[^{}]*\{[^}]*font-size:\s*16px/, "touch inputs are 16px so iOS does not zoom");
+  assert.match(body, /min-height:\s*100dvh/, "page height tracks the visible viewport");
+  assert.match(body, /h1\s*\{[^}]*overflow-wrap:\s*anywhere/, "a long unbroken label wraps instead of overflowing");
+  assert.match(body, /@media[^{]*max-width:\s*480px[^{]*max-height:\s*500px[^{]*\{\s*body\s*\{[^}]*align-items:\s*flex-start/, "phones top-align the card, clear of the keyboard");
 }
 
 {
@@ -757,15 +910,7 @@ function hasPreviewTags(page) {
   return /og:|twitter:/.test(page);
 }
 
-function manifestRequest(payload) {
-  return get("/admin/manifest", {
-    method: "POST",
-    headers: { authorization: "Bearer admin", "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-async function manifestPayload(overrides = {}) {
+async function previewManifestPayload(overrides = {}) {
   return {
     slug: "s1",
     label: "Acme Proposal",
@@ -898,7 +1043,7 @@ async function manifestPayload(overrides = {}) {
   //     og:site_name, og:image:alt and twitter:image:alt, HTML-escaped.
   const env = await previewEnv({ preview: null });
   const preview = { ...PREVIEW, site_name: `Acme & "Co" <x>`, image_alt: `Card: 'Q3' <plan> & more` };
-  assert.equal((await fetchHandler(manifestRequest(await manifestPayload({ preview })), env)).status, 200);
+  assert.equal((await fetchHandler(manifestRequest(await previewManifestPayload({ preview })), env)).status, 200);
   assert.deepEqual(storedScan(env).public_preview, preview);
   const page = await (await fetchHandler(get("/s1/"), env)).text();
   assert.match(page, /<meta property="og:site_name" content="Acme &amp; &quot;Co&quot; &lt;x&gt;">/);
@@ -911,20 +1056,20 @@ async function manifestPayload(overrides = {}) {
   // 5. The record is set by a publish with a preview and dropped by one without.
   //    The audit row records which.
   const env = await previewEnv({ preview: null });
-  const withPreview = await fetchHandler(manifestRequest(await manifestPayload({ preview: PREVIEW })), env);
+  const withPreview = await fetchHandler(manifestRequest(await previewManifestPayload({ preview: PREVIEW })), env);
   assert.equal(withPreview.status, 200);
   assert.deepEqual(storedScan(env), { visibility: "password", public_preview: STORED_PREVIEW });
   assert.equal((await fetchHandler(get("/s1/og.png"), env)).status, 200);
   assert.equal(JSON.parse(env.DB.audit.at(-1).details_json).preview, true);
 
-  const without = await fetchHandler(manifestRequest(await manifestPayload()), env);
+  const without = await fetchHandler(manifestRequest(await previewManifestPayload()), env);
   assert.equal(without.status, 200);
   assert.deepEqual(storedScan(env), { visibility: "password" }, "republish without preview drops the record");
   assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), env)), "og.png is gated again");
   assert.equal(JSON.parse(env.DB.audit.at(-1).details_json).preview, false);
 
   // Missing optional fields are stored as null.
-  await fetchHandler(manifestRequest(await manifestPayload({ preview: { title: "T", image_sha256: PNG_SHA } })), env);
+  await fetchHandler(manifestRequest(await previewManifestPayload({ preview: { title: "T", image_sha256: PNG_SHA } })), env);
   assert.deepEqual(storedScan(env).public_preview, {
     title: "T",
     description: null,
@@ -933,7 +1078,7 @@ async function manifestPayload(overrides = {}) {
     image_sha256: PNG_SHA,
   });
   // Only the known fields are stored.
-  await fetchHandler(manifestRequest(await manifestPayload({ preview: { ...PREVIEW, extra: "x" } })), env);
+  await fetchHandler(manifestRequest(await previewManifestPayload({ preview: { ...PREVIEW, extra: "x" } })), env);
   assert.deepEqual(Object.keys(storedScan(env).public_preview).sort(), [
     "description",
     "image_alt",
@@ -951,9 +1096,9 @@ async function manifestPayload(overrides = {}) {
   //     can turn the preview off, and it goes in the same D1 write. A leftover
   //     `preview:<slug>` KV key (from an older Worker) is ignored.
   const env = await previewEnv({ preview: null });
-  assert.equal((await fetchHandler(manifestRequest(await manifestPayload({ preview: PREVIEW })), env)).status, 200);
+  assert.equal((await fetchHandler(manifestRequest(await previewManifestPayload({ preview: PREVIEW })), env)).status, 200);
   assert.equal((await fetchHandler(get("/s1/og.png"), env)).status, 200);
-  assert.equal((await fetchHandler(manifestRequest(await manifestPayload()), env)).status, 200);
+  assert.equal((await fetchHandler(manifestRequest(await previewManifestPayload()), env)).status, 200);
   env.AUTH_KV.map.set("preview:s1", JSON.stringify(PREVIEW));
   const og = await fetchHandler(get("/s1/og.png"), env);
   assert.ok(await isLoginPage(og), "same card, no flag: og.png is the login page");
@@ -963,21 +1108,56 @@ async function manifestPayload(overrides = {}) {
 }
 
 {
+  // 5c. A republish that keeps the existing password (`drop update`) still sets
+  //     and clears the preview. The keep path skips the verifier write, never
+  //     the preview record.
+  const env = await previewEnv({ preview: null });
+  const keptVerifier = env.AUTH_KV.map.get("auth:s1");
+  const keep = { password_verifier: undefined, keep_password_verifier: true };
+
+  const on = await fetchHandler(manifestRequest(await previewManifestPayload({ ...keep, preview: PREVIEW })), env);
+  assert.equal(on.status, 200);
+  assert.deepEqual(storedScan(env), { visibility: "password", public_preview: STORED_PREVIEW }, "kept password + preview sets the record");
+  assert.equal((await fetchHandler(get("/s1/og.png"), env)).status, 200, "og.png loads with a kept password");
+  const onAudit = JSON.parse(env.DB.audit.at(-1).details_json);
+  assert.equal(onAudit.preview, true);
+  assert.equal(onAudit.kept_password_verifier, true);
+
+  const off = await fetchHandler(manifestRequest(await previewManifestPayload(keep)), env);
+  assert.equal(off.status, 200);
+  assert.deepEqual(storedScan(env), { visibility: "password" }, "kept password without a preview drops the record");
+  assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), env)), "og.png is gated again");
+  assert.equal(hasPreviewTags(await (await fetchHandler(get("/s1/"), env)).text()), false, "and no og tags");
+  const offAudit = JSON.parse(env.DB.audit.at(-1).details_json);
+  assert.equal(offAudit.preview, false);
+  assert.equal(offAudit.kept_password_verifier, true);
+
+  assert.equal(env.AUTH_KV.map.get("auth:s1"), keptVerifier, "the verifier is never rewritten");
+  assert.equal(env.AUTH_KV.puts.some(({ key }) => key === "auth:s1"), false);
+
+  // A bad preview is refused before the keep path changes anything.
+  const before = env.DB.rows.s1.scan_result_json;
+  const bad = await fetchHandler(manifestRequest(await previewManifestPayload({ ...keep, preview: { title: "T" } })), env);
+  assert.equal(bad.status, 400);
+  assert.equal(env.DB.rows.s1.scan_result_json, before, "a refused preview leaves the row alone");
+}
+
+{
   // 5c. A client-sent scan_result.public_preview grants nothing: without a valid
   //     `preview` it is stripped, and with one the server-written record wins.
   const env = await previewEnv({ preview: null });
-  const smuggled = await manifestPayload({ scan_result: { visibility: "password", public_preview: PREVIEW } });
+  const smuggled = await previewManifestPayload({ scan_result: { visibility: "password", public_preview: PREVIEW } });
   assert.equal((await fetchHandler(manifestRequest(smuggled), env)).status, 200);
   assert.deepEqual(storedScan(env), { visibility: "password" }, "a client-sent record is stripped");
   assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), env)), "a client-sent record unlocks nothing");
   assert.equal(hasPreviewTags(await (await fetchHandler(get("/s1/"), env)).text()), false);
 
   // `preview: null` is the same as no preview.
-  const nulled = await manifestPayload({ preview: null, scan_result: { public_preview: PREVIEW } });
+  const nulled = await previewManifestPayload({ preview: null, scan_result: { public_preview: PREVIEW } });
   assert.equal((await fetchHandler(manifestRequest(nulled), env)).status, 200);
   assert.deepEqual(storedScan(env), {});
 
-  const both = await manifestPayload({
+  const both = await previewManifestPayload({
     preview: { title: "Server title", image_sha256: PNG_SHA },
     scan_result: { public_preview: { title: "Client title", image_sha256: PNG_SHA, site_name: "Client" } },
   });
@@ -986,7 +1166,7 @@ async function manifestPayload(overrides = {}) {
   assert.equal(storedScan(env).public_preview.site_name, null);
 
   // A public share strips a client-sent record too, and serves as usual.
-  const pub = await manifestPayload({
+  const pub = await previewManifestPayload({
     auth_mode: "public",
     password_verifier: undefined,
     scan_result: { visibility: "public", public_preview: PREVIEW },
@@ -999,7 +1179,7 @@ async function manifestPayload(overrides = {}) {
   // Republishing as a public share drops the record.
   const env = await previewEnv();
   const res = await fetchHandler(
-    manifestRequest(await manifestPayload({ auth_mode: "public", password_verifier: undefined })),
+    manifestRequest(await previewManifestPayload({ auth_mode: "public", password_verifier: undefined })),
     env,
   );
   assert.equal(res.status, 200);
@@ -1009,7 +1189,7 @@ async function manifestPayload(overrides = {}) {
 {
   // /admin/list still works and returns the stored record inside scan_result.
   const env = await previewEnv({ preview: null });
-  assert.equal((await fetchHandler(manifestRequest(await manifestPayload({ preview: PREVIEW })), env)).status, 200);
+  assert.equal((await fetchHandler(manifestRequest(await previewManifestPayload({ preview: PREVIEW })), env)).status, 200);
   const res = await fetchHandler(get("/admin/list", { headers: { authorization: "Bearer admin" } }), env);
   assert.equal(res.status, 200);
   const s1 = (await res.json()).shares.find((share) => share.slug === "s1");
@@ -1056,7 +1236,7 @@ async function manifestPayload(overrides = {}) {
   for (const [overrides, message] of cases) {
     const env = await previewEnv({ preview: null });
     const before = { ...env.DB.rows.s1 };
-    const res = await fetchHandler(manifestRequest(await manifestPayload(overrides)), env);
+    const res = await fetchHandler(manifestRequest(await previewManifestPayload(overrides)), env);
     assert.equal(res.status, 400, JSON.stringify(overrides));
     assert.match(await res.text(), message, JSON.stringify(overrides));
     assert.deepEqual(env.DB.upserts, [], "a rejected manifest makes no D1 write");
@@ -1068,7 +1248,7 @@ async function manifestPayload(overrides = {}) {
   for (const text of ["x".repeat(300), "\u{1F600}".repeat(150)]) {
     const env = await previewEnv({ preview: null });
     const preview = { title: text, description: "y".repeat(1000), site_name: text, image_alt: text, image_sha256: PNG_SHA };
-    const ok = await fetchHandler(manifestRequest(await manifestPayload({ preview })), env);
+    const ok = await fetchHandler(manifestRequest(await previewManifestPayload({ preview })), env);
     assert.equal(ok.status, 200);
     assert.deepEqual(env.DB.upserts, ["s1"]);
     assert.deepEqual(storedScan(env).public_preview, preview);

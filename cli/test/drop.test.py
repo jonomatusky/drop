@@ -26,6 +26,8 @@ from pathlib import Path
 # by path. parents[1] is cli/ (this file lives in cli/test/).
 DROP = Path(__file__).resolve().parents[1] / "drop"
 drop = SourceFileLoader("drop", str(DROP)).load_module()
+# Several tests replace drop.admin_request outright; keep the real one.
+REAL_ADMIN_REQUEST = drop.admin_request
 
 # No keychain / env needed: every secret lookup yields a dummy token.
 drop.get_secret = lambda env_name, keychain_service, label: "tok"
@@ -137,8 +139,10 @@ def row(slug, auth_mode="public", label=None, expires_at=None, revoked_at=None, 
 class Fake:
     """Stands in for the admin API, R2, and the preflight; records calls in order."""
 
-    def __init__(self, rows=(), bucket_keys=(), s3=None):
+    def __init__(self, rows=(), bucket_keys=(), s3=None, missing_verifiers=()):
         self.rows = list(rows)
+        # Password shares whose stored verifier is gone from the Worker's KV.
+        self.missing_verifiers = set(missing_verifiers)
         self.bucket_keys = list(bucket_keys)
         self.s3_handler = s3
         self.events = []
@@ -153,6 +157,7 @@ class Fake:
         if path == "/admin/list":
             return {"shares": self.rows}
         if path == "/admin/manifest":
+            self.check_password(payload)
             self.manifests.append(payload)
             # Upsert like the Worker, so a later /admin/list sees this publish.
             live = {**row(payload["slug"], payload["auth_mode"], payload.get("label"), payload.get("expires_at")),
@@ -160,6 +165,18 @@ class Fake:
             self.rows = [r for r in self.rows if r.get("slug") != payload["slug"]] + [live]
             return {"ok": True, "slug": payload["slug"]}
         raise AssertionError(f"unexpected admin call {method} {path}")
+
+    def check_password(self, payload):
+        """The Worker's password rule for a manifest (merit b61f1d49): a password
+        share needs a verifier, or keep_password_verifier onto a live password
+        share whose verifier is still stored."""
+        if payload["auth_mode"] != "password" or payload.get("password_verifier"):
+            return
+        if payload.get("keep_password_verifier") is not True:
+            raise worker_400("missing password_verifier")
+        existing = next((r for r in self.rows if r.get("slug") == payload["slug"]), None)
+        if not existing or existing["auth_mode"] != "password" or payload["slug"] in self.missing_verifiers:
+            raise worker_400("no existing password to keep")
 
     def upload_r2(self, files, slug):
         self.events.append(("upload", slug))
@@ -189,6 +206,10 @@ class Fake:
 
     def index(self, kind):
         return self.kinds().index(kind)
+
+
+def worker_400(body):
+    return drop.AdminAPIError(f"admin API POST /admin/manifest -> HTTP 400: {body}", 400, body)
 
 
 @contextlib.contextmanager
@@ -318,6 +339,7 @@ def test_unlisted_slug_refused_for_password_share():
         "password share",
     )
     assert "remove its password" in err, err
+    assert f"`drop update {UNLISTED} <path>`" in err, err  # update keeps the password; no --password needed
 
 
 def test_unlisted_slug_refused_for_public_share_without_tail():
@@ -366,12 +388,117 @@ def test_update_password_share_with_password_sends_verifier():
     verifier = manifest["password_verifier"]
     digest = hashlib.pbkdf2_hmac("sha256", b"hunter2hunter2", base64.b64decode(verifier["salt"]), verifier["iterations"])
     assert digest.hex() == verifier["hash"], verifier  # the verifier is for THIS password, not a minted one
+    assert "keep_password_verifier" not in manifest, manifest  # --password sets a new one
     assert "password: hunter2hunter2" in out, out
 
 
-def test_update_password_share_without_password_refused():
-    err = refused(["update", "acme-proposal", "--yes", str(PAGE)], Fake(rows=[row("acme-proposal", auth_mode="password")]), "--password")
-    assert "lock out" in err, err
+def test_update_password_share_without_password_keeps_it():
+    fake = Fake(rows=[row("acme-proposal", auth_mode="password", label="Acme")])
+    code, out, err = run_cli(["update", "acme-proposal", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    manifest = fake.manifests[0]
+    assert manifest["auth_mode"] == "password", manifest
+    assert manifest["keep_password_verifier"] is True, manifest
+    assert "password_verifier" not in manifest, manifest  # never a minted password
+    assert manifest["scan_result"]["visibility"] == "password", manifest["scan_result"]
+    assert manifest["label"] == "Acme", manifest
+    assert "password kept" in out and "password:" not in out, out
+
+
+def test_update_password_share_dry_run_shows_the_keep_flag():
+    fake = Fake(rows=[row("acme-proposal", auth_mode="password")])
+    code, out, err = run_cli(["update", "acme-proposal", "--dry-run", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    manifest = json.loads(out)["manifest"]
+    assert manifest["keep_password_verifier"] is True and "password_verifier" not in manifest, manifest
+    assert not fake.manifests and "upload" not in fake.kinds(), fake.events
+
+
+def test_update_public_share_sends_no_keep_flag():
+    fake = Fake(rows=[row(UNLISTED, visibility="unlisted")])
+    code, out, err = run_cli(["update", UNLISTED, "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert "keep_password_verifier" not in fake.manifests[0], fake.manifests[0]
+    assert "password" not in out, out
+
+
+def test_update_keep_refused_when_the_stored_password_is_gone():
+    # The row says password, but the Worker has no verifier to keep: it refuses
+    # the manifest, and the CLI says why instead of echoing a bare HTTP 400.
+    fake = Fake(rows=[row("acme-proposal", auth_mode="password")], missing_verifiers={"acme-proposal"})
+    code, out, err = run_cli(["update", "acme-proposal", "--yes", str(PAGE)], fake)
+    assert code == 1, (code, out, err)
+    assert "no stored password to keep" in err and "--password" in err, err
+    assert "HTTP 400" not in err, err
+    # Upload runs before the manifest, so the refusal must not claim nothing changed.
+    assert "upload" in fake.kinds() and "already uploaded" in err, (fake.events, err)
+    assert not fake.manifests and "url:" not in out, (fake.manifests, out)
+    assert ("admin", "GET", "/admin/list") not in fake.events[fake.index("upload"):], fake.events  # no purge
+
+
+def test_update_keep_refused_when_the_share_is_gone_after_lookup():
+    class Vanishing(Fake):
+        def admin_request(self, method, path, token, payload=None):
+            if path == "/admin/manifest":
+                self.rows = []  # revoked and purged between the lookup and the write
+            return super().admin_request(method, path, token, payload)
+
+    fake = Vanishing(rows=[row("acme-proposal", auth_mode="password")])
+    code, out, err = run_cli(["update", "acme-proposal", "--yes", str(PAGE)], fake)
+    assert code == 1, (code, out, err)
+    assert "no stored password to keep" in err, err
+
+
+def test_update_keep_refused_by_a_worker_without_keep_support():
+    class OldWorker(Fake):
+        def check_password(self, payload):
+            if payload["auth_mode"] == "password" and not payload.get("password_verifier"):
+                raise worker_400("missing password_verifier")
+
+    fake = OldWorker(rows=[row("acme-proposal", auth_mode="password")])
+    code, out, err = run_cli(["update", "acme-proposal", "--yes", str(PAGE)], fake)
+    assert code == 1, (code, out, err)
+    assert "cannot keep a stored password" in err and "--password" in err, err
+    assert "already uploaded" in err, err
+
+
+def test_update_keep_passes_other_worker_errors_through():
+    class Broken(Fake):
+        def check_password(self, payload):
+            raise worker_400("invalid auth_mode")
+
+    code, out, err = run_cli(["update", "acme-proposal", "--yes", str(PAGE)], Broken(rows=[row("acme-proposal", auth_mode="password")]))
+    assert code == 1, (code, out, err)
+    assert "HTTP 400: invalid auth_mode" in err, err
+
+
+def test_admin_request_keeps_status_and_body_on_http_error():
+    import urllib.error
+    import urllib.request
+
+    def refuse(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, io.BytesIO(b"no existing password to keep\n"))
+
+    saved = urllib.request.urlopen
+    urllib.request.urlopen = refuse
+    try:
+        REAL_ADMIN_REQUEST("POST", "/admin/manifest", "tok", {"slug": "s"})
+    except drop.AdminAPIError as err:
+        assert err.status == 400 and err.body == "no existing password to keep", (err.status, err.body)
+        assert isinstance(err, drop.PublishError)
+        assert "HTTP 400: no existing password to keep" in str(err), err
+    else:
+        raise AssertionError("admin_request should raise on HTTP 400")
+    finally:
+        urllib.request.urlopen = saved
+
+
+def test_empty_password_refused():
+    # An unset "$pw" must not quietly keep the old password (update) or mint one (publish).
+    refused(["update", "acme-proposal", "--password", "", "--yes", str(PAGE)],
+            Fake(rows=[row("acme-proposal", auth_mode="password")]), "--password is empty")
+    refused(["--slug", "acme-proposal", "--password", "", "--yes", str(PAGE)], Fake(), "--password is empty")
+    refused(["--password", "", "--yes", str(PAGE)], Fake(), "--password is empty")
 
 
 def test_update_public_share_with_password_refused():

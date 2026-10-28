@@ -109,19 +109,23 @@ and the expiry. The bytes upload onto that slug's own prefix, and the manifest
 row is upserted where it sits. `created_at` and the view history survive.
 
 ```bash
-drop update quarterly-report --password "$pw" build/report.html
+drop update quarterly-report build/report.html                 # password share: keeps its password
 drop update acme-proposal-k7f3m9q2x8p4n6tz build/report.html   # unlisted: no password
 ```
 
 - **Pass a flag to change a setting.** `--label`/`--client` and `--expire`
   replace the inherited value. `--public`, `--unlisted`, and `--slug` are
   refused, because the slug and the tier come from the share.
-- **A password share needs `--password` every time.** The Worker can't keep the
-  stored verifier yet, so `update` refuses rather than mint a new password and
-  lock out everyone who has the current one.
-- **No republish keeps recipients logged in.** The verifier re-salts on every
-  publish — same password, different hash — and the login cookie binds that hash,
-  so every live cookie dies either way.
+- **A password share keeps its password.** Without `--password`, `update` sends
+  `keep_password_verifier: true` and no verifier, and the Worker leaves the stored
+  verifier untouched. The password still works, and so does every recipient's
+  login cookie. The Worker refuses (HTTP 400, `no existing password to keep`) if
+  the share has no stored password by the time the manifest lands, and `update`
+  reports that plainly. `update` never mints a password.
+- **`--password` sets a new password.** It writes a fresh verifier. The verifier
+  re-salts on every publish (same password, different hash), and the login
+  cookie binds that hash, so every live cookie dies, even when the password is
+  the same one.
 - **It refuses a share it can't sensibly continue:** an unknown slug, a revoked
   share (revoke is an ending), or an expired one unless you pass `--expire`.
 - **The public preview is not inherited.** Pass `--public-preview` again to keep
@@ -497,7 +501,7 @@ drop --client "Acme" path/to/report            # password, readable slug "acme-�
 drop --unlisted --client "Acme" path/to/report # secret link: no password, unguessable URL
 drop --public path/to/site                     # truly public: no password, guessable URL
 drop --password "$pw" --expire 7d path/to/site # explicit password + 7-day expiry
-drop update acme-proposal --password "$pw" ... # republish in place: same URL, keeps tier/label/expiry
+drop update acme-proposal ...                  # republish in place: same URL, keeps tier/password/label/expiry
 drop --slug acme-proposal --password "$pw" ... # republish at an exact slug, settings from flags
 drop --public --card-title "Q3 Deck" path/site # override the generated link-preview card title
 drop --public --card-image hero.jpg path/site  # use your own preview image instead of the card

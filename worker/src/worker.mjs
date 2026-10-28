@@ -416,17 +416,18 @@ function loginPage(share, { error = false, preview = null, origin = "" } = {}) {
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   body {
-    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    margin: 0; min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center;
     background: #f3f4f6; color: #111827; padding: 24px;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
   .card {
-    width: 100%; max-width: 360px; background: #ffffff; border: 1px solid #e5e7eb;
+    width: 100%; max-width: 360px; min-width: 0; background: #ffffff; border: 1px solid #e5e7eb;
     border-radius: 12px; padding: 32px 28px; box-shadow: 0 1px 3px rgba(0,0,0,.08);
   }
   .lock { font-size: 28px; text-align: center; margin-bottom: 12px; }
-  h1 { font-size: 18px; font-weight: 600; text-align: center; margin: 0 0 6px; line-height: 1.3; }
+  h1 { font-size: 18px; font-weight: 600; text-align: center; margin: 0 0 6px; line-height: 1.3; overflow-wrap: anywhere; }
   .sub { font-size: 13px; color: #6b7280; text-align: center; margin: 0 0 20px; }
   label { display: block; font-size: 12px; font-weight: 600; color: #374151; margin-bottom: 6px; }
   input[type=password] {
@@ -440,6 +441,18 @@ function loginPage(share, { error = false, preview = null, origin = "" } = {}) {
   }
   button:hover { background: #374151; }
   .err { font-size: 13px; color: #b91c1c; text-align: center; margin: 0 0 14px; }
+  /* Phones and tablets. iOS Safari zooms into any input under 16px on focus,
+     which leaves the page zoomed and scrolling sideways after login. */
+  @media (pointer: coarse) {
+    input[type=password], button { font-size: 16px; }
+  }
+  /* Phones, portrait or landscape. Sit the card near the top so the on-screen
+     keyboard does not cover the field (it shrinks only the visual viewport,
+     not 100dvh), and give the card more of the narrow width. */
+  @media (max-width: 480px), (max-height: 500px) {
+    body { align-items: flex-start; padding: max(16px, 8vh) 16px 16px; }
+    .card { padding: 28px 20px; }
+  }
   @media (prefers-color-scheme: dark) {
     body { background: #0b0f17; color: #e5e7eb; }
     .card { background: #111827; border-color: #1f2937; box-shadow: none; }
@@ -730,12 +743,27 @@ async function upsertManifest(request, env) {
   }
   if (!["password", "public"].includes(payload.auth_mode)) return badRequest("invalid auth_mode");
   if (!Array.isArray(payload.files) || payload.files.length === 0) return badRequest("files must be a non-empty array");
-  if (payload.auth_mode === "password" && !payload.password_verifier) return badRequest("missing password_verifier");
+
+  let keptPasswordVerifier = false;
+  if (payload.auth_mode === "password" && !payload.password_verifier) {
+    if (payload.keep_password_verifier !== true) return badRequest("missing password_verifier");
+    const existingShare = await env.DB.prepare(
+      "SELECT auth_mode FROM shares WHERE slug = ?",
+    ).bind(payload.slug).first();
+    const existingVerifier = existingShare?.auth_mode === "password"
+      ? await env.AUTH_KV.get(`auth:${payload.slug}`)
+      : null;
+    if (!existingShare || existingShare.auth_mode !== "password" || existingVerifier === null) {
+      return badRequest("no existing password to keep");
+    }
+    keptPasswordVerifier = true;
+  }
   // --- public link preview: validate (see validatePreview) ---
   const previewError = validatePreview(payload);
   if (previewError) return badRequest(previewError);
   // --- end public link preview ---
   // --- public link preview: set or strip scan_result.public_preview (see withPublicPreview) ---
+  // Runs whether or not the verifier is kept, so a kept-password republish without a preview clears it.
   payload.scan_result = withPublicPreview(payload.scan_result, payload.preview);
   // --- end public link preview ---
 
@@ -765,20 +793,22 @@ async function upsertManifest(request, env) {
     payload.uploader,
   ).run();
 
-  if (payload.auth_mode === "password") {
+  if (payload.auth_mode === "password" && !keptPasswordVerifier) {
     await env.AUTH_KV.put(`auth:${payload.slug}`, JSON.stringify(payload.password_verifier));
-  } else {
+  } else if (payload.auth_mode === "public") {
     await env.AUTH_KV.delete(`auth:${payload.slug}`);
   }
   await env.AUTH_KV.delete(`deny:${payload.slug}`);
-  await recordAudit(env, payload.slug, "publish", payload.uploader, {
+  const auditDetails = {
     auth_mode: payload.auth_mode,
     bytes: payload.bytes,
     files: payload.files.map((file) => file.path),
     scan_result: payload.scan_result,
     override_log: payload.override_log || [],
     preview: Boolean(payload.preview),
-  });
+  };
+  if (keptPasswordVerifier) auditDetails.kept_password_verifier = true;
+  await recordAudit(env, payload.slug, "publish", payload.uploader, auditDetails);
 
   return json({ ok: true, slug: payload.slug });
 }

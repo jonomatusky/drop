@@ -27,7 +27,7 @@ drop --client "Acme" path/to/report            # password, readable slug "acme-�
 drop --unlisted --client "Acme" path/to/report # secret link: no password, unguessable URL
 drop --public path/to/site                     # truly public: no password, guessable URL
 drop --password "$pw" --expire 7d path/to/site # explicit password + 7-day expiry
-drop update acme-proposal --password "$pw" path/to/report  # republish IN PLACE (same URL, keeps tier/label/expiry)
+drop update acme-proposal path/to/report                    # republish IN PLACE (same URL, keeps tier/password/label/expiry)
 drop --slug acme-proposal --password "$pw" path/to/report   # republish at an exact slug; settings from flags
 drop --public --card-title "Q3 Deck" path/site # override the link-preview card title
 drop --public --card-image hero.jpg path/site  # your own preview image instead of the card
@@ -124,7 +124,7 @@ slug's own prefix and the manifest upsert updates the row already sitting there.
 `created_at` and the view history survive.
 
 ```bash
-drop update quarterly-report --password "$pw" --yes build/report.html
+drop update quarterly-report --yes build/report.html                 # password share: keeps its password
 drop update acme-proposal-k7f3m9q2x8p4n6tz --yes build/report.html   # unlisted
 ```
 
@@ -136,17 +136,20 @@ an expired one unless you pass `--expire`.
 
 Five things to know before rerunning a republish:
 
-- **A password share needs `--password` every time.** The Worker can't keep the
-  stored verifier yet, so `update` refuses without it rather than mint a new
-  password and lock out everyone who has the current one. Plain `--slug` has no
-  such guard: omit `--password` there and it mints a fresh random one.
-- **No republish keeps recipients logged in.** The password verifier takes a
-  fresh random salt on every publish — same password, different hash — and the
+- **`drop update` keeps a password share's password, and its logins.** Without
+  `--password` it asks the Worker to keep the stored verifier
+  (`keep_password_verifier`), so the password still works and recipients stay
+  logged in. It prints `password kept:` instead of a `password:` line. If the
+  share lost its stored password after the lookup, the Worker refuses and
+  `update` says so; an older Worker without keep support is reported the same
+  way. Plain `--slug` has no such behavior: omit `--password` there and it mints
+  a fresh random one.
+- **`--password` sets a new password and logs everyone out.** The verifier takes
+  a fresh random salt on every write — same password, different hash — and the
   login cookie is a MAC over slug + verifier hash, so every live cookie stops
   validating once the new verifier propagates (it lives in KV, which is
-  eventually consistent, so a stale edge can honor the old one briefly).
-  Passing the same `--password` preserves the password they already have; it
-  does not spare them the login page.
+  eventually consistent, so a stale edge can honor the old one briefly). Passing
+  the same password again keeps the password but not the logins.
 - **Plain `--slug` rebuilds the manifest from this run's flags.** Only the expiry
   carries over: a future `expires_at` is kept unless you pass `--expire`. Omit
   `--client`/`--label` and the label clears; omit `--public` and a public share
