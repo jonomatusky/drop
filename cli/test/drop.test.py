@@ -14,6 +14,7 @@ import base64
 import contextlib
 import datetime as dt
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -25,7 +26,10 @@ from pathlib import Path
 # The CLI is a single executable file named `drop` (no .py extension), so load it
 # by path. parents[1] is cli/ (this file lives in cli/test/).
 DROP = Path(__file__).resolve().parents[1] / "drop"
-drop = SourceFileLoader("drop", str(DROP)).load_module()
+# load_module() is gone in Python 3.15; exec_module() works on every supported version.
+_loader = SourceFileLoader("drop", str(DROP))
+drop = importlib.util.module_from_spec(importlib.util.spec_from_loader("drop", _loader))
+_loader.exec_module(drop)
 # Several tests replace drop.admin_request outright; keep the real one.
 REAL_ADMIN_REQUEST = drop.admin_request
 
