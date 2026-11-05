@@ -550,7 +550,9 @@ only the share's label.
 
 - On the correct password the Worker replies `303` and sets an **HttpOnly, Secure,
   SameSite=Lax** cookie scoped to that share's path, so the recipient isn't
-  re-prompted on every asset. The cookie value is a **stateless HMAC** —
+  re-prompted on every page. (A sandboxed page's own requests for images, CSS
+  and scripts carry no cookie; see [Isolation](#isolation-each-share-runs-in-a-sandbox).)
+  The cookie value is a **stateless HMAC** —
   `base64url(HMAC-SHA256(ADMIN_TOKEN, "v1:<slug>:<verifierHash>"))` — recomputed
   and constant-time-compared on every request, so there is **no session store**.
   Because it binds the password verifier, rotating a share's password (a republish
@@ -577,6 +579,91 @@ only the share's label.
   the preview is read. The card loads without the password only while that
   sha256 matches both the manifest's `og.png` row and the bytes in R2. The login
   page carries the tags only while it matches the manifest.
+
+---
+
+## Isolation: each share runs in a sandbox
+
+Every share is a path on one origin. Without isolation, a script in one share
+could `fetch()` another share that the visitor unlocked in the last 12 hours
+(the login cookie is scoped by path, and a cookie path does not separate
+scripts on one origin), or read and change another share's `localStorage`. A
+compromised CDN script inside any share would get all of that.
+
+So every artifact response carries:
+
+```
+Content-Security-Policy: sandbox allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads allow-pointer-lock
+```
+
+There is no `allow-same-origin`, so each page runs in an opaque origin of its own
+(`self.origin === "null"`). The header goes on every artifact response, not only
+HTML: an SVG or XML file opened on its own is a document too. drop's own login
+page is not sandboxed; it has its own strict CSP.
+
+What a sandboxed page loses (measured in Chromium and WebKit):
+
+- `localStorage`, `sessionStorage`, IndexedDB, service workers and
+  `document.cookie` throw.
+- Every request the page makes is cross-site, so the browser sends no
+  SameSite=Lax login cookie with it. **A password share's own images, CSS and
+  scripts do not load**, because they get the login page. A self-contained page
+  (everything inline) works. Links between pages still work: a top-level
+  navigation carries the cookie.
+- `fetch()`, module scripts, fonts and `crossorigin` images are CORS requests
+  with `Origin: null`. A public share answers them with
+  `Access-Control-Allow-Origin: *`, so these work on `--public` and
+  `--unlisted` shares. A password share never sends that header.
+
+The extra tokens keep ordinary pages working: `allow-modals` (without it,
+`alert()` and `confirm()` return at once), `allow-popups-to-escape-sandbox`
+(without it, a `target=_blank` link opens the other site sandboxed too, and its
+own storage throws) and `allow-pointer-lock` (mouse-look games). None of them
+gives the page the origin.
+
+### Opting out: `--same-origin`
+
+A share that needs any of the above runs on the shared origin instead:
+
+```bash
+drop --public --same-origin path/to/game        # localStorage high scores, a service worker
+drop update tokyo-line --same-origin path/site  # a password share that loads its own assets
+drop update my-game --no-same-origin path/game  # back into the sandbox
+```
+
+- The Worker stores the opt-out in the share's D1 row as
+  `scan_result.same_origin`. It writes it only from the manifest's top-level
+  `same_origin` field and strips any copy a client sends inside `scan_result`.
+- **It is kept across republishes.** A manifest without the field keeps the
+  live share's setting, so a republish from an older CLI, or one that forgot
+  the flag, does not break a share that needs the origin. `--no-same-origin`
+  turns it off. A revoked share's setting does not carry over to a new publish
+  on its slug.
+- The publish prints `sandbox: off (…)` for an opted-out share, and `drop list`
+  marks it `same-origin`.
+- When a share is sandboxed, the CLI warns if its pages or scripts mention
+  `localStorage`, `sessionStorage`, `indexedDB`, `serviceWorker` or
+  `document.cookie`, and if a password share has files besides its pages. These
+  are warnings only: a page that wraps its storage calls in `try`/`catch` works.
+
+An opted-out share has the old exposure: its scripts can read any other share
+the visitor unlocked, and other opted-out shares' storage. Opt out only pages
+whose scripts you trust, ideally with no third-party scripts.
+
+To opt out a live share without republishing it (for example, before deploying
+this Worker over shares that need the origin), set the field in D1 directly:
+
+```bash
+wrangler d1 execute <db> --remote --command \
+  "UPDATE shares SET scan_result_json = json_set(scan_result_json, '$.same_origin', json('true')) WHERE slug IN ('my-game')"
+```
+
+**What the sandbox does not fix.** A sandboxed page can still draw a fake drop
+login form and send what is typed in it anywhere, and in Chromium it can
+`history.pushState` its address bar to another share's path. Only a separate
+origin per share closes that: serving each share from its own subdomain
+(`<slug>.drop.example.com`) would give full origin isolation, with no opt-out
+needed for storage. That is the longer-term option.
 
 ---
 

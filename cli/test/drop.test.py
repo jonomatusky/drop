@@ -1261,6 +1261,122 @@ def test_confirmation_mentions_the_public_preview():
     assert "preview" not in without and "without the password" not in without, without
 
 
+# --- Share sandbox opt-out (--same-origin) ------------------------------------
+
+STORAGE_SITE = Path(_ARTIFACTS.name) / "storage-site"
+STORAGE_SITE.mkdir()
+(STORAGE_SITE / "index.html").write_text('<html><head><meta charset="utf-8"><title>Game</title></head><body><script src="app.js"></script></body></html>')
+(STORAGE_SITE / "app.js").write_text("try { localStorage.setItem('best', 3); } catch (e) {}\n")
+
+ASSET_SITE = Path(_ARTIFACTS.name) / "asset-site"
+ASSET_SITE.mkdir()
+(ASSET_SITE / "index.html").write_text('<html><head><meta charset="utf-8"><title>Report</title></head><body><img src="chart.png"></body></html>')
+(ASSET_SITE / "chart.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+
+def same_origin_row(slug, **kwargs):
+    live = row(slug, **kwargs)
+    live["scan_result"]["same_origin"] = True
+    return live
+
+
+def test_same_origin_flag_is_sent_and_printed():
+    fake = Fake()
+    code, out, err = run_cli(["--same-origin", "--yes", str(STORAGE_SITE)], fake)
+    assert code == 0, err
+    assert fake.manifests[0]["same_origin"] is True, fake.manifests[0]
+    assert "sandbox: off (--same-origin: the page runs on drop's shared origin)" in out.splitlines(), out
+    assert "sandbox" not in err, err  # an opted-out share gets no sandbox warning
+
+
+def test_no_same_origin_flag_sends_false():
+    fake = Fake(rows=[same_origin_row(UNLISTED, visibility="unlisted")])
+    code, out, err = run_cli(["update", UNLISTED, "--no-same-origin", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert fake.manifests[0]["same_origin"] is False, fake.manifests[0]
+    assert "sandbox:" not in out, out
+
+
+def test_no_flag_sends_no_same_origin_field():
+    fake = Fake()
+    code, out, err = run_cli(["--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert "same_origin" not in fake.manifests[0], fake.manifests[0]
+    assert "sandbox:" not in out, out
+
+
+def test_update_says_the_live_opt_out_is_kept():
+    # The Worker keeps the live setting when the field is absent; the CLI says so.
+    fake = Fake(rows=[same_origin_row(UNLISTED, visibility="unlisted")])
+    code, out, err = run_cli(["update", UNLISTED, "--yes", str(STORAGE_SITE)], fake)
+    assert code == 0, err
+    assert "same_origin" not in fake.manifests[0], fake.manifests[0]
+    assert "kept from the live share, --no-same-origin turns it off" in out, out
+    assert "throws in drop's sandbox" not in err, err
+
+
+def test_plain_slug_says_the_live_opt_out_is_kept():
+    fake = Fake(rows=[same_origin_row("game")])
+    code, out, err = run_cli(["--public", "--slug", "game", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert "kept from the live share" in out, out
+
+
+def test_revoked_share_opt_out_is_not_reported_as_kept():
+    assert not drop.row_same_origin(same_origin_row("old", revoked_at=PAST))
+    assert drop.row_same_origin(same_origin_row("live"))
+    assert not drop.row_same_origin(row("plain"))
+    assert not drop.row_same_origin(None)
+
+
+def test_sandbox_warning_names_the_storage_api():
+    fake = Fake()
+    code, out, err = run_cli(["--public", "--yes", str(STORAGE_SITE)], fake)
+    assert code == 0, err
+    assert "the page uses localStorage (app.js), which throws in drop's sandbox" in err, err
+    assert "--same-origin" in err, err
+
+
+def test_password_share_with_assets_is_warned():
+    fake = Fake()
+    code, out, err = run_cli(["--yes", str(ASSET_SITE)], fake)
+    assert code == 0, err
+    assert "password share with 1 file besides its pages (e.g. chart.png)" in err, err
+    assert "sends no login cookie" in err, err
+    # A public share's assets load fine in the sandbox.
+    fake = Fake()
+    code, out, err = run_cli(["--public", "--yes", str(ASSET_SITE)], fake)
+    assert code == 0, err
+    assert "login cookie" not in err, err
+    # A single-page password share is fine too.
+    fake = Fake()
+    code, out, err = run_cli(["--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert "login cookie" not in err, err
+
+
+def test_dry_run_manifest_carries_same_origin():
+    fake = Fake()
+    code, out, err = run_cli(["--same-origin", "--dry-run", "--yes", str(PAGE)], fake)
+    assert code == 0, err
+    assert json.loads(out)["manifest"]["same_origin"] is True, out
+
+
+def test_list_marks_same_origin_shares():
+    drop.admin_request = lambda method, path, token, payload=None: {
+        "shares": [
+            {"slug": "game", "auth_mode": "public", "bytes": 1, "scan_result": {"same_origin": True}},
+            {"slug": "doc", "auth_mode": "public", "bytes": 1, "scan_result": {}},
+        ]
+    }
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        drop.cmd_list(argparse.Namespace())
+    game, doc = buf.getvalue().splitlines()
+    assert game.endswith(" same-origin"), game
+    assert "same-origin" not in doc, doc
+
+
 def main():
     tests = [value for name, value in globals().items() if name.startswith("test_") and callable(value)]
     for test in tests:

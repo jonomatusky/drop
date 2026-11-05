@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, webcrypto } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { constantTimeEqual, contentTypeFor, fetchHandler, parseSlug, shareCookieToken } from "../src/worker.mjs";
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
@@ -173,6 +175,16 @@ class DB {
             // `ON CONFLICT ... DO UPDATE SET` keeps its old value here too.
             const updated = { ...prior };
             for (const [, column] of sql.matchAll(/(\w+)\s*=\s*excluded\.\1\b/g)) updated[column] = incoming[column];
+            // The scan_result_json SET keeps a live same_origin opt-out when
+            // the manifest leaves the field out (the 11th bind is 1). The real
+            // SQL runs against SQLite in the share-sandbox tests below.
+            if (/scan_result_json = CASE/.test(sql)) {
+              const keep = this.values[10] === 1 && !prior.revoked_at && JSON.parse(prior.scan_result_json || "{}").same_origin === true;
+              const next = JSON.parse(scan_result_json);
+              updated.scan_result_json = keep && next && typeof next === "object" && !Array.isArray(next)
+                ? JSON.stringify({ ...next, same_origin: true })
+                : scan_result_json;
+            }
             if (/revoked_at\s*=\s*NULL/.test(sql)) updated.revoked_at = null;
             self.rows[slug] = updated;
           }
@@ -1455,4 +1467,254 @@ async function previewManifestPayload(overrides = {}) {
   env.ARTIFACTS.sizes.set("s1/og.png", undefined);
   assert.ok(await isLoginPage(await fetchHandler(get("/s1/og.png"), env)));
   assert.equal(env.ARTIFACTS.buffered, 0);
+}
+
+// === Share sandbox: each page runs in an opaque origin unless it opted out ===
+
+const SANDBOX = "sandbox allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads allow-pointer-lock";
+
+async function sandboxEnv(rows) {
+  const env = await envFor(rows, { "auth:s1": JSON.stringify(await verifier("pw")) });
+  env.ARTIFACTS.objects.set("public/app.js", "1");
+  env.ARTIFACTS.objects.set("public/pic.svg", "<svg/>");
+  return env;
+}
+
+function publicRow(overrides = {}) {
+  return row("public", {
+    auth_mode: "public",
+    files_json: JSON.stringify([{ path: "index.html" }, { path: "app.js" }, { path: "pic.svg" }]),
+    ...overrides,
+  });
+}
+
+{
+  // A public share: every artifact response is sandboxed, not just the HTML
+  // (an SVG opened on its own is a document too), and answers CORS from the
+  // page's opaque origin so fetch(), module scripts and fonts still load.
+  const env = await sandboxEnv({ public: publicRow() });
+  for (const path of ["/public/", "/public/index.html", "/public/app.js", "/public/pic.svg"]) {
+    const res = await fetchHandler(new Request(`https://share.example.test${path}`), env);
+    assert.equal(res.status, 200, path);
+    assert.equal(res.headers.get("content-security-policy"), SANDBOX, `${path} is sandboxed`);
+    assert.equal(res.headers.get("access-control-allow-origin"), "*", `${path} answers CORS`);
+    assert.doesNotMatch(res.headers.get("content-security-policy"), /allow-same-origin/);
+  }
+  const head = await fetchHandler(new Request("https://share.example.test/public/", { method: "HEAD" }), env);
+  assert.equal(head.headers.get("content-security-policy"), SANDBOX, "HEAD carries the same headers");
+}
+
+{
+  // A password share: the unlocked page is sandboxed and never answers CORS.
+  // The login page is drop's own and keeps its own CSP, with no sandbox: it
+  // must set the cookie.
+  const env = await sandboxEnv({ s1: row("s1") });
+  const page = await fetchHandler(new Request("https://share.example.test/s1/", { headers: { authorization: auth } }), env);
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get("content-security-policy"), SANDBOX);
+  assert.equal(page.headers.get("access-control-allow-origin"), null, "a password share never answers CORS");
+
+  const login = await fetchHandler(new Request("https://share.example.test/s1/"), env);
+  assert.match(await login.text(), /password-protected/);
+  assert.doesNotMatch(login.headers.get("content-security-policy"), /sandbox/, "the login page is not sandboxed");
+  assert.equal(login.headers.get("access-control-allow-origin"), null);
+
+  const posted = await fetchHandler(
+    new Request("https://share.example.test/s1/", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "password=pw",
+    }),
+    env,
+  );
+  assert.equal(posted.status, 303);
+  assert.equal(posted.headers.get("content-security-policy"), null, "the login redirect is not sandboxed");
+}
+
+{
+  // An opted-out share runs on the shared origin: no sandbox. A public one
+  // still answers CORS.
+  const env = await sandboxEnv({
+    public: publicRow({ scan_result_json: JSON.stringify({ same_origin: true }) }),
+    s1: row("s1", { scan_result_json: JSON.stringify({ same_origin: true }) }),
+  });
+  const pub = await fetchHandler(new Request("https://share.example.test/public/"), env);
+  assert.equal(pub.headers.get("content-security-policy"), null);
+  assert.equal(pub.headers.get("access-control-allow-origin"), "*");
+  const pw = await fetchHandler(new Request("https://share.example.test/s1/", { headers: { authorization: auth } }), env);
+  assert.equal(pw.status, 200);
+  assert.equal(pw.headers.get("content-security-policy"), null);
+
+  // Only a literal `true` opts out.
+  const truthy = await sandboxEnv({ public: publicRow({ scan_result_json: JSON.stringify({ same_origin: "yes" }) }) });
+  const res = await fetchHandler(new Request("https://share.example.test/public/"), truthy);
+  assert.equal(res.headers.get("content-security-policy"), SANDBOX);
+}
+
+{
+  // The public preview card a password share serves without the password is
+  // an artifact response too.
+  const env = await previewEnv();
+  const card = await fetchHandler(get("/s1/og.png"), env);
+  assert.equal(card.status, 200);
+  assert.equal(card.headers.get("content-security-policy"), SANDBOX);
+  assert.equal(card.headers.get("access-control-allow-origin"), null);
+}
+
+async function publishAudit(env) {
+  return JSON.parse(env.DB.audit.filter((event) => event.event === "publish").at(-1).details_json);
+}
+
+{
+  // same_origin: true is stored server-side as scan_result.same_origin and
+  // audited; a fresh share without the field is sandboxed.
+  const env = await envFor({});
+  let res = await fetchHandler(manifestRequest(manifestPayload({ slug: "fresh", password_verifier: await verifier("pw") })), env);
+  assert.equal(res.status, 200);
+  assert.equal((storedScan(env, "fresh")).same_origin, undefined);
+  assert.equal((await publishAudit(env)).same_origin, undefined);
+
+  res = await fetchHandler(manifestRequest(manifestPayload({ slug: "opted", same_origin: true, password_verifier: await verifier("pw") })), env);
+  assert.equal(res.status, 200);
+  assert.deepEqual(storedScan(env, "opted"), { clean: true, same_origin: true });
+  assert.equal((await publishAudit(env)).same_origin, true);
+}
+
+{
+  // A client cannot set it inside scan_result: only the top-level field counts.
+  const env = await envFor({});
+  const res = await fetchHandler(
+    manifestRequest(manifestPayload({ scan_result: { clean: true, same_origin: true }, password_verifier: await verifier("pw") })),
+    env,
+  );
+  assert.equal(res.status, 200);
+  assert.deepEqual(storedScan(env, "s1"), { clean: true });
+}
+
+{
+  // A republish without the field keeps the live share's setting (so an older
+  // CLI, or a forgotten flag, does not break a share that needs it), and
+  // same_origin: false turns it off.
+  const env = await envFor({ s1: row("s1", { scan_result_json: JSON.stringify({ clean: true, same_origin: true }) }) });
+  const pw = { password_verifier: await verifier("pw") };
+  let res = await fetchHandler(manifestRequest(manifestPayload(pw)), env);
+  assert.equal(res.status, 200);
+  assert.equal((storedScan(env, "s1")).same_origin, true, "kept without the field");
+
+  res = await fetchHandler(manifestRequest(manifestPayload({ ...pw, same_origin: null })), env);
+  assert.equal((storedScan(env, "s1")).same_origin, true, "null counts as absent");
+
+  res = await fetchHandler(manifestRequest(manifestPayload({ ...pw, same_origin: false })), env);
+  assert.equal(res.status, 200);
+  assert.equal((storedScan(env, "s1")).same_origin, undefined, "false turns it off");
+
+  res = await fetchHandler(manifestRequest(manifestPayload(pw)), env);
+  assert.equal((storedScan(env, "s1")).same_origin, undefined, "and it stays off");
+}
+
+{
+  // A revoked share's opt-out does not carry over to a new publish on its slug.
+  const env = await envFor({
+    s1: row("s1", { revoked_at: "2026-10-01T00:00:00Z", scan_result_json: JSON.stringify({ same_origin: true }) }),
+  });
+  const res = await fetchHandler(manifestRequest(manifestPayload({ password_verifier: await verifier("pw") })), env);
+  assert.equal(res.status, 200);
+  assert.equal((storedScan(env, "s1")).same_origin, undefined);
+}
+
+{
+  // Refusals: a non-boolean flag, or an opt-out with nowhere to store it. No
+  // row is written.
+  const env = await envFor({});
+  const pw = { password_verifier: await verifier("pw") };
+  let res = await fetchHandler(manifestRequest(manifestPayload({ ...pw, same_origin: "true" })), env);
+  assert.equal(res.status, 400);
+  assert.equal(await res.text(), "same_origin must be a boolean\n");
+  res = await fetchHandler(manifestRequest(manifestPayload({ ...pw, same_origin: true, scan_result: "clean" })), env);
+  assert.equal(res.status, 400);
+  assert.equal(await res.text(), "same_origin needs scan_result to be an object\n");
+  assert.deepEqual(env.DB.upserts, []);
+}
+
+// --- The opt-out's keep, against real SQLite ----------------------------------
+// The fake DB above only imitates the upsert. These run the Worker's own SQL
+// against schema.sql in SQLite (D1 is SQLite), with a minimal D1-shaped adapter.
+
+function sqliteD1() {
+  const db = new DatabaseSync(":memory:");
+  db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  return {
+    db,
+    prepare(sql) {
+      let values = [];
+      const stmt = db.prepare(sql);
+      return {
+        bind(...v) { values = v; return this; },
+        async first() { return stmt.get(...values) ?? null; },
+        async all() { return { results: stmt.all(...values) }; },
+        async run() { stmt.run(...values); return {}; },
+      };
+    },
+  };
+}
+
+async function sqliteEnv() {
+  return { ARTIFACTS: new R2({}), AUTH_KV: new KV(), DB: sqliteD1(), ADMIN_TOKEN: "admin" };
+}
+
+function sqliteScan(env, slug = "s1") {
+  return JSON.parse(env.DB.db.prepare("SELECT scan_result_json FROM shares WHERE slug = ?").get(slug).scan_result_json);
+}
+
+async function sqlitePublish(env, overrides = {}) {
+  const res = await fetchHandler(manifestRequest(manifestPayload({ auth_mode: "public", ...overrides })), env);
+  assert.equal(res.status, 200, await res.clone().text());
+}
+
+{
+  const env = await sqliteEnv();
+  await sqlitePublish(env, { same_origin: true });
+  assert.deepEqual(sqliteScan(env), { clean: true, same_origin: true });
+  await sqlitePublish(env);
+  assert.deepEqual(sqliteScan(env), { clean: true, same_origin: true }, "kept without the field");
+  await sqlitePublish(env, { scan_result: { clean: false, same_origin: false } });
+  assert.deepEqual(sqliteScan(env), { clean: false, same_origin: true }, "a client copy neither clears nor shows");
+  await sqlitePublish(env, { same_origin: false });
+  assert.deepEqual(sqliteScan(env), { clean: true }, "false clears it");
+  await sqlitePublish(env);
+  assert.deepEqual(sqliteScan(env), { clean: true }, "and it stays off");
+}
+
+{
+  // Only a JSON `true` is kept: a stored 1 or "true" is not an opt-out.
+  for (const stored of ['{"same_origin":1}', '{"same_origin":"true"}', "not json"]) {
+    const env = await sqliteEnv();
+    await sqlitePublish(env);
+    env.DB.db.prepare("UPDATE shares SET scan_result_json = ? WHERE slug = 's1'").run(stored);
+    await sqlitePublish(env);
+    assert.deepEqual(sqliteScan(env), { clean: true }, stored);
+  }
+}
+
+{
+  // Not carried from a revoked row.
+  const env = await sqliteEnv();
+  await sqlitePublish(env, { same_origin: true });
+  env.DB.db.prepare("UPDATE shares SET revoked_at = '2026-11-01T00:00:00Z' WHERE slug = 's1'").run();
+  await sqlitePublish(env);
+  assert.deepEqual(sqliteScan(env), { clean: true });
+}
+
+{
+  // Two overlapping publishes, one that leaves the field out and one that turns
+  // the opt-out off, end with it off whichever starts first: the keep reads the
+  // row at the moment of its own write, never a copy read earlier.
+  for (const order of ["keep-first", "clear-first"]) {
+    const env = await sqliteEnv();
+    await sqlitePublish(env, { same_origin: true });
+    const keep = () => sqlitePublish(env, { sha256: "keep" });
+    const clear = () => sqlitePublish(env, { sha256: "clear", same_origin: false });
+    await Promise.all(order === "keep-first" ? [keep(), clear()] : [clear(), keep()]);
+    assert.equal(sqliteScan(env).same_origin, undefined, order);
+  }
 }
