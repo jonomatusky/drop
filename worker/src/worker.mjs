@@ -395,6 +395,77 @@ function withPublicPreview(scanResult, preview) {
 }
 // --- end public link preview -------------------------------------------------
 
+// --- share sandbox (opaque origin per page) ----------------------------------
+// Every share is a path on one origin, so without this a script in one share
+// could fetch() another share the visitor unlocked (the login cookie is scoped by
+// path, and a cookie path does not separate scripts on one origin), or read and
+// change another share's localStorage. Every artifact response therefore carries
+// a CSP `sandbox` with no `allow-same-origin`: a page drop serves runs in an
+// opaque origin of its own (`self.origin === "null"`).
+//
+// What the sandbox costs a page, all measured in Chromium and WebKit:
+// - Every request the page makes is cross-site, so the browser sends no
+//   SameSite=Lax login cookie with it. A password share's own images, CSS and
+//   scripts do not load; only a share whose page is self-contained works. The
+//   cookie still goes with a top-level navigation, so the page itself loads.
+// - fetch(), module scripts, fonts and crossorigin images are CORS requests
+//   with `Origin: null`. A public share answers them with
+//   `access-control-allow-origin: *` (its bytes are public anyway). A password
+//   share never does: those requests carry no cookie, and they get the login page.
+// - localStorage, sessionStorage, IndexedDB, service workers and document.cookie
+//   throw.
+//
+// A share that needs any of that opts out with `--same-origin` (manifest
+// `same_origin: true`, stored by upsertManifest as `scan_result.same_origin`).
+// It then runs on the shared origin exactly as before this change.
+//
+// The extra tokens keep ordinary pages working: allow-modals (alert/confirm
+// otherwise return at once), allow-popups-to-escape-sandbox (a target=_blank
+// link otherwise opens the other site sandboxed, where its own storage throws),
+// allow-pointer-lock (mouse-look games). None of them grants the origin.
+const SHARE_SANDBOX_CSP =
+  "sandbox allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads allow-pointer-lock";
+
+function sharesOrigin(share) {
+  const scan = share.scan_result;
+  return Boolean(scan && typeof scan === "object" && scan.same_origin === true);
+}
+
+// The headers that set where an artifact response runs. The login page and
+// drop's other own responses never get them.
+function isolationHeaders(share) {
+  const headers = {};
+  if (!sharesOrigin(share)) headers["content-security-policy"] = SHARE_SANDBOX_CSP;
+  if (share.auth_mode === "public") headers["access-control-allow-origin"] = "*";
+  return headers;
+}
+
+// The scan_result to store, with `same_origin: true` only when the share opted
+// out of the sandbox. Like public_preview, a client-sent copy inside scan_result
+// is dropped: only the manifest's top-level `same_origin` sets it.
+function withSameOrigin(scanResult, sameOrigin) {
+  if (!scanResult || typeof scanResult !== "object" || Array.isArray(scanResult)) return scanResult;
+  const { same_origin: _clientSent, ...rest } = scanResult;
+  return sameOrigin ? { ...rest, same_origin: true } : rest;
+}
+
+// A manifest's `same_origin: true` or `false` sets the opt-out. A manifest
+// without the field keeps the live share's setting, so a republish from an
+// older CLI, or one that forgot the flag, does not break a share that needs the
+// shared origin. A revoked share's setting is not carried to a new publish.
+// The keep is decided inside the upsert itself (SAME_ORIGIN_KEEP_SQL), not read
+// first and written later: two overlapping publishes of one slug could
+// otherwise bring back an opt-out that the other had just turned off.
+const SAME_ORIGIN_KEEP_SQL = `CASE
+         WHEN ? = 1
+           AND shares.revoked_at IS NULL
+           AND json_type(CASE WHEN json_valid(shares.scan_result_json) THEN shares.scan_result_json ELSE '{}' END, '$.same_origin') = 'true'
+           AND json_type(excluded.scan_result_json) = 'object'
+         THEN json_set(excluded.scan_result_json, '$.same_origin', json('true'))
+         ELSE excluded.scan_result_json
+       END`;
+// --- end share sandbox -------------------------------------------------------
+
 // Minimal, unbranded, fully self-contained login page (no external assets). Shows
 // the share label as a heading; otherwise reveals nothing. Served instead of the
 // old HTTP Basic dialog so browsers get a clean, professional, client-facing page.
@@ -674,6 +745,7 @@ async function serveArtifact(request, env, url, ctx) {
   const headers = securityHeaders({
     "content-type": contentTypeFor(objectPath, object),
     "etag": object.httpEtag || undefined,
+    ...isolationHeaders(share),
   });
   if (request.method === "HEAD") return new Response(null, { status: 200, headers });
   const response = new Response(body, { status: 200, headers });
@@ -766,6 +838,16 @@ async function upsertManifest(request, env) {
   // Runs whether or not the verifier is kept, so a kept-password republish without a preview clears it.
   payload.scan_result = withPublicPreview(payload.scan_result, payload.preview);
   // --- end public link preview ---
+  // --- share sandbox: set, clear, or keep the opt-out (see SAME_ORIGIN_KEEP_SQL) ---
+  const sameOriginSet = typeof payload.same_origin === "boolean";
+  if (payload.same_origin !== undefined && payload.same_origin !== null && !sameOriginSet) {
+    return badRequest("same_origin must be a boolean");
+  }
+  if (payload.same_origin === true && (!payload.scan_result || typeof payload.scan_result !== "object" || Array.isArray(payload.scan_result))) {
+    return badRequest("same_origin needs scan_result to be an object");
+  }
+  payload.scan_result = withSameOrigin(payload.scan_result, payload.same_origin === true);
+  // --- end share sandbox ---
 
   await env.DB.prepare(
     `INSERT INTO shares (slug, label, auth_mode, sha256, files_json, bytes, scan_result_json, created_at, expires_at, revoked_at, uploader)
@@ -776,7 +858,7 @@ async function upsertManifest(request, env) {
        sha256 = excluded.sha256,
        files_json = excluded.files_json,
        bytes = excluded.bytes,
-       scan_result_json = excluded.scan_result_json,
+       scan_result_json = ${SAME_ORIGIN_KEEP_SQL},
        expires_at = excluded.expires_at,
        revoked_at = NULL,
        uploader = excluded.uploader`,
@@ -791,6 +873,7 @@ async function upsertManifest(request, env) {
     payload.created_at,
     payload.expires_at || null,
     payload.uploader,
+    sameOriginSet ? 0 : 1,
   ).run();
 
   if (payload.auth_mode === "password" && !keptPasswordVerifier) {
@@ -808,6 +891,8 @@ async function upsertManifest(request, env) {
     preview: Boolean(payload.preview),
   };
   if (keptPasswordVerifier) auditDetails.kept_password_verifier = true;
+  // The audit records an explicit set or clear; a kept setting is not an action.
+  if (sameOriginSet) auditDetails.same_origin = payload.same_origin;
   await recordAudit(env, payload.slug, "publish", payload.uploader, auditDetails);
 
   return json({ ok: true, slug: payload.slug });

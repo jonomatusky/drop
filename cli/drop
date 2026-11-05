@@ -1669,6 +1669,62 @@ def inherited_expiry(row: dict | None, args: argparse.Namespace) -> tuple[str | 
     return row["expires_at"], None
 
 
+# --- Share sandbox ------------------------------------------------------------
+#
+# The Worker serves every share in a CSP sandbox, so each page runs in an opaque
+# origin of its own and one share's scripts cannot read another share or its
+# storage (see SHARE_SANDBOX_CSP in worker.mjs). A page that needs drop's shared
+# origin opts out with --same-origin. The Worker keeps that setting across
+# republishes, from any CLI, until --no-same-origin turns it off.
+
+# Browser APIs that throw in an opaque origin.
+SANDBOX_BLOCKED_API_RE = re.compile(rb"\b(?:localStorage|sessionStorage|indexedDB|serviceWorker)\b|\bdocument\.cookie\b")
+SANDBOX_SCANNED_SUFFIXES = (".html", ".htm", ".js", ".mjs", ".svg")
+SANDBOX_SCAN_MAX_BYTES = 8 * 1024 * 1024
+
+
+def row_same_origin(row: dict | None) -> bool:
+    """Whether the live share opted out of the sandbox. A revoked share's
+    setting does not carry over, matching the Worker."""
+    if not row or row.get("revoked_at"):
+        return False
+    scan = row.get("scan_result")
+    return isinstance(scan, dict) and scan.get("same_origin") is True
+
+
+def sandbox_warnings(files: list[tuple[Path, str]], auth_mode: str) -> list[str]:
+    """What the sandbox may break in this artifact. A text scan, so a warning,
+    never a refusal: a page that guards its storage calls in try/catch works."""
+    warnings = []
+    seen: dict[str, str] = {}
+    for path, rel in files:
+        if not rel.lower().endswith(SANDBOX_SCANNED_SUFFIXES):
+            continue
+        try:
+            if path.stat().st_size > SANDBOX_SCAN_MAX_BYTES:
+                continue
+            data = path.read_bytes()
+        except OSError:
+            continue
+        for match in SANDBOX_BLOCKED_API_RE.finditer(data):
+            seen.setdefault(match.group(0).decode(), rel)
+    if seen:
+        found = ", ".join(f"{api} ({rel})" for api, rel in sorted(seen.items()))
+        warnings.append(
+            f"the page uses {found}, which throws in drop's sandbox; "
+            "if the page needs it, republish with --same-origin"
+        )
+    if auth_mode == "password" and _html_files(files):
+        assets = [rel for _, rel in files if not rel.lower().endswith((".html", ".htm"))]
+        if assets:
+            warnings.append(
+                f"password share with {len(assets)} file{'' if len(assets) == 1 else 's'} besides its pages "
+                f"(e.g. {assets[0]}): in drop's sandbox the browser sends no login cookie with the page's own "
+                "requests, so images, CSS and scripts it loads will not load; republish with --same-origin if it loads them"
+            )
+    return warnings
+
+
 # --- Publish ----------------------------------------------------------------
 
 
@@ -1693,6 +1749,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
     token = None
     expires_at = args.expire.isoformat() if args.expire else None
     notes: list[str] = []
+    row = None
     if args.slug:
         # An explicit slug republishes in place. Look the row up before the slow
         # preflight so a refusal costs nothing, and so the dry run inherits and
@@ -1712,6 +1769,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
         token=token,
         notes=notes,
         visibility="unlisted" if args.unlisted else "public" if args.public else "password",
+        current_same_origin=row_same_origin(row),
     )
 
 
@@ -1754,6 +1812,7 @@ def cmd_update(slug: str, args: argparse.Namespace) -> None:
         # update does not guess one from the slug: an unrecorded tier stays
         # unrecorded rather than turning a heuristic into a fact.
         visibility=share_visibility(row) or ("password" if row["auth_mode"] == "password" else None),
+        current_same_origin=row_same_origin(row),
     )
 
 
@@ -1767,6 +1826,7 @@ def publish_artifact(
     notes: list[str],
     visibility: str | None,
     keep_password: bool = False,
+    current_same_origin: bool = False,
 ) -> None:
     """The one publish path behind both `drop <path>` and `drop update`: scan,
     stage, upload, write the manifest, and (for a republish) purge stale files.
@@ -1775,9 +1835,14 @@ def publish_artifact(
     means a fresh share whose slug is derived and made unique here. The caller
     has already settled the tier, password, and expiry. ``keep_password`` asks
     the Worker to keep a password share's stored verifier instead of taking a
-    new one, so its password and recipients' login cookies still work."""
+    new one, so its password and recipients' login cookies still work.
+    ``current_same_origin`` is the live share's sandbox opt-out, which the
+    Worker keeps unless --same-origin or --no-same-origin is passed."""
     path = Path(args.path).expanduser().resolve()
     files = iter_files(path)
+    same_origin = current_same_origin if args.same_origin is None else args.same_origin
+    if not same_origin:
+        notes.extend(sandbox_warnings(files, auth_mode))
     if not args.no_card and not _html_files(files):
         # The preview lives in og: meta inside an HTML page. With no HTML there is
         # nowhere to put it, so these would be silently ignored.
@@ -1876,6 +1941,8 @@ def publish_artifact(
             manifest["password_verifier"] = password_verifier(password)
         elif keep_password:
             manifest["keep_password_verifier"] = True
+        if args.same_origin is not None:
+            manifest["same_origin"] = args.same_origin
         if args.public_preview:
             preview = preview_payload(card_note, file_rows)
             final_text = {key: preview[key] for key in ("title", "description", "site_name", "image_alt")}
@@ -1928,6 +1995,9 @@ def publish_artifact(
         print(f"card: {card_note['image']}")
     if args.public_preview:
         print("preview: public (title, description, site name, alt text and og.png load without the password)")
+    if same_origin:
+        kept = "" if args.same_origin else "; kept from the live share, --no-same-origin turns it off"
+        print(f"sandbox: off (--same-origin: the page runs on drop's shared origin{kept})")
     if password:
         print(f"password: {password}")
     elif keep_password:
@@ -1974,7 +2044,8 @@ def cmd_list(_: argparse.Namespace) -> None:
         expires = f" expires={row['expires_at']}" if row.get("expires_at") else ""
         label = f" label={row['label']}" if row.get("label") else ""
         views = f" views={row.get('views', 0)}"
-        print(f"{row['slug']} {row['auth_mode']} bytes={row['bytes']}{views}{label}{expires}{revoked}")
+        same_origin = " same-origin" if row_same_origin(row) else ""
+        print(f"{row['slug']} {row['auth_mode']} bytes={row['bytes']}{views}{label}{expires}{same_origin}{revoked}")
 
 
 def cmd_views(args: argparse.Namespace) -> None:
@@ -2064,6 +2135,14 @@ def build_parser(prog: str = "drop") -> argparse.ArgumentParser:
         action="store_true",
         help="password shares only: show the link-preview card (title, description, generated og.png) to anyone "
         "with the link, without the password; not kept on republish unless passed again",
+    )
+    parser.add_argument(
+        "--same-origin",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="run this share's pages on drop's shared origin instead of in the sandbox, for a page that needs "
+        "localStorage, a service worker, or (on a password share) its own images, CSS and scripts; kept on "
+        "republish until --no-same-origin",
     )
     # Republish: an exact slug skips the clash resolver, so the bytes land on that
     # slug's own prefix and the manifest row is upserted in place. The row is

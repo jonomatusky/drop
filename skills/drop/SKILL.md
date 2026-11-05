@@ -33,6 +33,7 @@ drop --public --card-title "Q3 Deck" path/site # override the link-preview card 
 drop --public --card-image hero.jpg path/site  # your own preview image instead of the card
 drop --public --no-card path/to/site           # skip the card and the preview meta tags
 drop --public-preview path/to/site             # password share whose link preview shows without the password
+drop --public --same-origin path/to/game       # run on drop's shared origin, outside the sandbox (localStorage, service worker)
 drop --dry-run path/to/site                    # preflight + print the manifest, upload nothing
 drop list                                      # every share, with a views=N column
 drop views <slug>                              # who opened it: count + recent timestamps / IPs / UAs
@@ -307,7 +308,7 @@ A password share serves a clean, self-contained HTML login page — one password
 field and a **View** button — not the browser's two-field Basic-Auth dialog. It
 carries no external assets, is `noindex`, and shows only the share's label. On
 the correct password the Worker sets a stateless, signed, HttpOnly cookie scoped
-to that share's path, so the recipient isn't re-prompted on every asset.
+to that share's path, so the recipient isn't re-prompted on every page.
 
 Non-browser clients keep using Basic Auth: `curl -u anything:<password>
 https://drop.example.com/<slug>/` works, since the username is ignored and only
@@ -324,6 +325,31 @@ uploads to R2 before it writes the manifest. So while a republish that changes
 the card is in flight, the unauthenticated `og.png` gets the login page. That
 is the check working, not a failed publish; check again once the publish
 returns.
+
+## The sandbox, and `--same-origin`
+
+Every page drop serves runs in a CSP sandbox with an opaque origin of its own,
+so a script in one share cannot read another share the visitor unlocked, or
+another share's storage. In the sandbox:
+
+- `localStorage`, `sessionStorage`, IndexedDB, service workers and
+  `document.cookie` throw.
+- A **password share's own images, CSS and scripts do not load**: the browser
+  sends no login cookie with the page's own requests. Inline everything into
+  the page, or opt out.
+- On a public or unlisted share, `fetch()` of the share's own files, module
+  scripts and fonts work (the Worker answers CORS with `*`).
+
+`--same-origin` opts one share out; it then runs on the shared origin as before.
+Use it for games and apps that save state, and for password shares that load
+their own assets. The publish prints `sandbox: off (…)`, and `drop list` marks
+the share `same-origin`. The Worker **keeps** the opt-out across republishes,
+from any CLI, until `--no-same-origin` turns it off. The CLI warns when a
+sandboxed share mentions a blocked API or is a password share with asset files.
+Read those warnings: a page that guards its storage in `try`/`catch` is fine.
+
+Opt out only pages whose scripts you trust. An opted-out share's scripts can
+read any other share the visitor unlocked.
 
 ## View tracking
 
